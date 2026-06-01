@@ -114,16 +114,15 @@ class RedditIntelBot(commands.Bot):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 async def main() -> None:
-    bot = RedditIntelBot()
-    try:
-        async with bot:
-            await bot.start(settings.discord_bot_token)
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    except discord.LoginFailure:
-        logger.critical("Invalid Discord bot token. Check your .env file.")
-        sys.exit(1)
-
+    from bot.db import init_db
+    from bot.web_portal import start_web_server
+    
+    await init_db()
+    logger.info("Platform database initialized successfully.")
+    
+    # We run ONLY the web server, completely bypassing the Discord bot
+    # since this instance is acting purely as an API sidecar.
+    await start_web_server(None)
 
 if __name__ == "__main__":
     asyncio.run(main())
