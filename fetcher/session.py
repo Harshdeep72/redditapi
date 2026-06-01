@@ -33,47 +33,9 @@ BOOTSTRAP_URLS = [
     "https://www.reddit.com/r/popular/",
 ]
 
-# ── User-Agent pool ────────────────────────────────────────────────────────────
-USER_AGENTS: list[str] = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
-]
-
-# Headers that mimic a real Chrome browser navigating to Reddit
-def _browser_headers(user_agent: str) -> dict[str, str]:
-    return {
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-        "Connection": "keep-alive",
-    }
-
-# Headers for follow-up .json API requests (same session, simulating XHR)
-def _json_headers(user_agent: str, referer: str = "https://www.reddit.com/") -> dict[str, str]:
-    return {
-        "User-Agent": user_agent,
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": referer,
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "Connection": "keep-alive",
-    }
+# Removed hardcoded USER_AGENTS and custom header dicts. 
+# curl_cffi with impersonate="chrome120" automatically handles all of this
+# far better than hardcoded dictionaries, and prevents JA3 fingerprint mismatches.
 
 
 class RedditSession:
@@ -104,7 +66,6 @@ class RedditSession:
         self._proxies_fetched = False
 
         self._session: AsyncSession | None = None
-        self._user_agent: str = random.choice(USER_AGENTS)
         self._last_request_time: float = 0.0
         self._last_cookie_refresh: float = 0.0
         self._cookie_lock = asyncio.Lock()
@@ -190,16 +151,12 @@ class RedditSession:
         for url in warmup_sequence:
             try:
                 is_json = url.endswith(".json")
-                headers = (
-                    _json_headers(self._user_agent, referer="https://www.reddit.com/r/popular/")
-                    if is_json
-                    else _browser_headers(self._user_agent)
-                )
+                req_headers = {"Accept": "application/json", "Referer": "https://www.reddit.com/"} if is_json else None
 
                 logger.info("Cookie warm-up: GET %s", url)
                 resp = await self._session.get(  # type: ignore[union-attr]
                     url,
-                    headers=headers,
+                    headers=req_headers,
                     timeout=20,
                     allow_redirects=True,
                 )
@@ -260,8 +217,7 @@ class RedditSession:
                 ):
                     success = await self._acquire_cookies()
                     if not success:
-                        # Rotate user agent on failure and retry once
-                        self._user_agent = random.choice(USER_AGENTS)
+                        # Retry once on failure
                         await self._acquire_cookies()
 
     # ── Request throttle ──────────────────────────────────────────────────────
@@ -296,7 +252,7 @@ class RedditSession:
         await self._maybe_refresh_cookies()
         await self._throttle()
 
-        headers = _json_headers(self._user_agent, referer=referer)
+        headers = {"Accept": "application/json", "Referer": referer}
 
         try:
             logger.debug("GET %s (attempt %d)", url, attempt + 1)
