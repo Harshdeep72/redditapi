@@ -131,12 +131,6 @@ class RedditSession:
         Visit Reddit pages with browser-grade headers to obtain a full
         session cookie jar. Uses a multi-step warm-up sequence to acquire
         the complete set of session cookies Reddit requires for .json access.
-
-        Key cookies required:
-          - loid            : logged-out user ID (required for .json access)
-          - csv             : country/variant cookie
-          - edgebucket      : CDN routing cookie
-          - session_tracker : analytics session (optional)
         """
         await self._ensure_session()
 
@@ -206,10 +200,8 @@ class RedditSession:
             not self._cookies_ready
             or (now - self._last_cookie_refresh) > self.cookie_refresh_interval
         )
-
         if needs_refresh:
             async with self._cookie_lock:
-                # Double-check inside lock to avoid thundering herd
                 now = time.monotonic()
                 if (
                     not self._cookies_ready
@@ -217,8 +209,11 @@ class RedditSession:
                 ):
                     success = await self._acquire_cookies()
                     if not success:
-                        # Retry once on failure
-                        await self._acquire_cookies()
+                        logger.warning("Cookie bootstrap failed, rotating proxy and retrying...")
+                        await self.close()  # Force close to discard the current dead proxy
+                        success = await self._acquire_cookies()
+                        if not success:
+                            logger.error("Cookie bootstrap failed again after proxy rotation.")
 
     # ── Request throttle ──────────────────────────────────────────────────────
 
