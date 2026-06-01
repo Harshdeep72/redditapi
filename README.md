@@ -1,3 +1,12 @@
+---
+title: RedditOSINT API
+emoji: 🚀
+colorFrom: blue
+colorTo: purple
+sdk: docker
+pinned: false
+app_port: 7860
+---
 # Reddit Intelligence Bot
 
 A powerful Discord bot that transforms any Reddit user, post, comment, or thread into a detailed intelligence report.
