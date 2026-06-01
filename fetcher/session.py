@@ -92,14 +92,16 @@ class RedditSession:
         max_retries: int = 3,
         cookie_refresh_interval: int = COOKIE_REFRESH_INTERVAL,
         reddit_session: str | None = None,
-        proxy_url: str | None = None,
+        proxy_list_url: str | None = None,
     ) -> None:
         self.delay_min = delay_min
         self.delay_max = delay_max
         self.max_retries = max_retries
         self.cookie_refresh_interval = cookie_refresh_interval
         self.reddit_session = reddit_session
-        self.proxy_url = proxy_url
+        self.proxy_list_url = proxy_list_url
+        self.proxy_list: list[str] = []
+        self._proxies_fetched = False
 
         self._session: AsyncSession | None = None
         self._user_agent: str = random.choice(USER_AGENTS)
@@ -127,10 +129,38 @@ class RedditSession:
 
     async def _ensure_session(self) -> None:
         """Create the curl_cffi session if not yet created."""
+        if self.proxy_list_url and not self._proxies_fetched:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(self.proxy_list_url, timeout=10) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            lines = text.splitlines()
+                            self.proxy_list = [line.strip() for line in lines if line.strip()]
+                            logger.info("Successfully loaded %d proxies from Webshare URL", len(self.proxy_list))
+                self._proxies_fetched = True
+            except Exception as e:
+                logger.error("Failed to fetch proxy list from URL: %s", e)
+                self._proxies_fetched = True
+
         if self._session is None:
-            proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
+            proxies = None
+            if self.proxy_list:
+                proxy = random.choice(self.proxy_list)
+                parts = proxy.split(":")
+                if len(parts) == 4:
+                    ip, port, user, pwd = parts
+                    proxy_formatted = f"http://{user}:{pwd}@{ip}:{port}"
+                elif len(parts) == 2:
+                    ip, port = parts
+                    proxy_formatted = f"http://{ip}:{port}"
+                else:
+                    proxy_formatted = f"http://{proxy}"
+                proxies = {"http": proxy_formatted, "https": proxy_formatted}
+
             self._session = AsyncSession(impersonate="chrome120", proxies=proxies)
-            logger.debug(f"Created new curl_cffi AsyncSession (chrome120 TLS) with proxies={bool(self.proxy_url)}")
+            logger.debug(f"Created new curl_cffi AsyncSession (chrome120 TLS) with proxies={bool(proxies)}")
         if self.reddit_session:
             self._session.cookies.set("reddit_session", self.reddit_session, domain=".reddit.com")
             logger.debug("Ensured custom reddit_session cookie is set in AsyncSession")
@@ -294,6 +324,8 @@ class RedditSession:
                 await asyncio.sleep(wait)
                 # Re-acquire cookies to get a fresh session after rate limit
                 self._cookies_ready = False
+                if self.proxy_list:
+                    await self.close() # Close session to force proxy rotation
                 if attempt < self.max_retries - 1:
                     return await self.get_json(url, params, referer, attempt + 1)
                 return None
@@ -304,6 +336,8 @@ class RedditSession:
                     logger.warning("403 on %s — re-acquiring cookies and retrying.", url)
                     self._cookies_ready = False
                     self._user_agent = random.choice(USER_AGENTS)
+                    if self.proxy_list:
+                        await self.close() # Force proxy rotation
                     await self._maybe_refresh_cookies()
                     await asyncio.sleep(random.uniform(2, 5))
                     return await self.get_json(url, params, referer, attempt + 1)
@@ -329,6 +363,8 @@ class RedditSession:
 
         except Exception as exc:
             logger.error("Request exception for %s (attempt %d): %s", url, attempt + 1, exc)
+            if self.proxy_list:
+                await self.close() # Force proxy rotation on failure
             if attempt < self.max_retries - 1:
                 wait = 2 ** attempt + random.uniform(0, 1)
                 await asyncio.sleep(wait)

@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     request_delay_max: float = Field(default=3.0, description="Max delay between requests (s)")
     cookie_refresh_interval: int = Field(default=600, description="How often to re-acquire Reddit session cookies (seconds)")
     reddit_session: str | None = Field(default=None, description="Reddit account session cookie (reddit_session value)")
-    proxy_url: str | None = Field(default=None, description="Proxy URL for fetcher (http://user:pass@host:port)")
+    proxy_list_url: str | None = Field(default=None, description="Direct download URL for Webshare proxy list")
 
     # Cache
     cache_backend: str = Field(default="memory", description="Cache backend: memory or sqlite")
