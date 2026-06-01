@@ -29,6 +29,7 @@ class FetchRouter:
             delay_max=settings.request_delay_max,
             cookie_refresh_interval=settings.cookie_refresh_interval,
             reddit_session=settings.reddit_session,
+            proxy_url=settings.proxy_url,
         )
         self._json = JSONFetcher(self._session, max_items=settings.max_fetch_items)
         self._praw: PRAWFetcher | None = None

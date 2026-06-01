@@ -92,12 +92,14 @@ class RedditSession:
         max_retries: int = 3,
         cookie_refresh_interval: int = COOKIE_REFRESH_INTERVAL,
         reddit_session: str | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self.delay_min = delay_min
         self.delay_max = delay_max
         self.max_retries = max_retries
         self.cookie_refresh_interval = cookie_refresh_interval
         self.reddit_session = reddit_session
+        self.proxy_url = proxy_url
 
         self._session: AsyncSession | None = None
         self._user_agent: str = random.choice(USER_AGENTS)
@@ -126,8 +128,9 @@ class RedditSession:
     async def _ensure_session(self) -> None:
         """Create the curl_cffi session if not yet created."""
         if self._session is None:
-            self._session = AsyncSession(impersonate="chrome120")
-            logger.debug("Created new curl_cffi AsyncSession (chrome120 TLS)")
+            proxies = {"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None
+            self._session = AsyncSession(impersonate="chrome120", proxies=proxies)
+            logger.debug(f"Created new curl_cffi AsyncSession (chrome120 TLS) with proxies={bool(self.proxy_url)}")
         if self.reddit_session:
             self._session.cookies.set("reddit_session", self.reddit_session, domain=".reddit.com")
             logger.debug("Ensured custom reddit_session cookie is set in AsyncSession")
