@@ -2893,7 +2893,9 @@ async def handle_external_check_comment(request: web.Request) -> web.Response:
                 "liveness": liveness,
                 "author": author,
                 "subreddit": comment.get("subreddit", ""),
-                "body_snippet": body[:120] + ("..." if len(body) > 120 else "")
+                "body_snippet": body[:120] + ("..." if len(body) > 120 else ""),
+                "upvotes": comment.get("score"),
+                "createdAt": comment.get("created_utc")
             }
         })
     except Exception as e:
