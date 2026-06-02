@@ -2855,7 +2855,9 @@ async def handle_external_check_post(request: web.Request) -> web.Response:
                 "liveness": liveness,
                 "author": author,
                 "subreddit": post_data.get("subreddit", ""),
-                "title": post_data.get("title", "")
+                "title": post_data.get("title", ""),
+                "upvotes": post_data.get("ups", 0) if "ups" in post_data else post_data.get("score", 0),
+                "created_utc": post_data.get("created_utc", 0)
             }
         })
     except Exception as e:
