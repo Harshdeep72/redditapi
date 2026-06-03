@@ -289,6 +289,7 @@ async def check_comment(url: str):
         result = {
             "status": status,
             "author": author if author != "[deleted]" else None,
+            "subreddit": comment_data.get("subreddit") or subreddit,
             "body_preview": body[:100] if body else None,
             "score": comment_data.get("score", 0),
             "depth": comment_data.get("depth", 0),
@@ -358,6 +359,7 @@ async def check_post(url: str):
         result = {
             "status": status,
             "author": author if author != "[deleted]" else None,
+            "subreddit": post_data.get("subreddit") or subreddit,
             "title": post_data.get("title"),
             "score": post_data.get("score", 0),
             "num_comments": post_data.get("num_comments", 0),
