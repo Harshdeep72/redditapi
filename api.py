@@ -61,6 +61,10 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         "Accept": "application/json, text/html",
         "Accept-Language": "en-US,en;q=0.9",
     }
+    
+    cookie = os.environ.get("REDDIT_SESSION_COOKIE")
+    if cookie:
+        headers["Cookie"] = f"reddit_session={cookie}"
 
     # Attempt 1: Direct request without proxy
     try:
