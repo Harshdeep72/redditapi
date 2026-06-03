@@ -62,6 +62,26 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         "Accept-Language": "en-US,en;q=0.9",
     }
 
+    # Attempt 1: Direct request without proxy
+    try:
+        async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
+            resp = await session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                allow_redirects=allow_redirects,
+                timeout=8.0
+            )
+            
+            # If not blocked, return immediately
+            if resp.status_code not in (403, 429) and "challenge platform" not in resp.text.lower() and "just a moment" not in resp.text.lower():
+                return resp
+                
+            last_err = f"Direct request blocked (HTTP {resp.status_code})"
+    except Exception as e:
+        last_err = f"Direct request error: {str(e)}"
+
+    # Attempt 2+: Use proxies
     for attempt in range(max_retries):
         proxy = get_healthy_proxy()
         proxies_config = {"http": proxy, "https": proxy} if proxy else None
@@ -81,7 +101,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                 if resp.status_code in (403, 429) or "challenge platform" in resp.text.lower() or "just a moment" in resp.text.lower():
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                    last_err = f"Blocked (HTTP {resp.status_code})"
+                    last_err = f"Proxy blocked (HTTP {resp.status_code})"
                     continue
                     
                 # Success or standard error like 404
@@ -92,9 +112,9 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         except Exception as e:
             if proxy:
                 PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-            last_err = str(e)
+            last_err = f"Proxy error: {str(e)}"
             
-    raise Exception(f"All {max_retries} attempts failed. Last error: {last_err}")
+    raise Exception(f"Direct + {max_retries} proxy attempts failed. Last error: {last_err}")
 
 
 async def resolve_url(url: str) -> str:
