@@ -297,10 +297,16 @@ async def check_comment(url: str):
             "error": None
         }
         
+        # Backward compatibility aliases for the Node.js bot
+        result["liveness"] = status if status != "live" else "live"
+        
         http_status = 200 if status == "live" else 404
         
         print(f"[COMMENT] {comment_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
-        return Response(content=json.dumps(result), status_code=http_status, media_type="application/json")
+        
+        # Wrap in success/data to maintain backward compatibility with older Node.js parser
+        final_response = {"success": True, "data": result}
+        return Response(content=json.dumps(final_response), status_code=http_status, media_type="application/json")
 
     except Exception as e:
         return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=500, media_type="application/json")
@@ -360,9 +366,15 @@ async def check_post(url: str):
             "error": None
         }
         
+        # Backward compatibility aliases for the Node.js bot
+        result["liveness"] = status if status not in ("active", "spam") else "live"
+        
         http_status = 200 if status == "active" else 404
         print(f"[POST] {post_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
-        return Response(content=json.dumps(result), status_code=http_status, media_type="application/json")
+        
+        # Wrap in success/data to maintain backward compatibility
+        final_response = {"success": True, "data": result}
+        return Response(content=json.dumps(final_response), status_code=http_status, media_type="application/json")
 
     except Exception as e:
         return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=500, media_type="application/json")
