@@ -125,24 +125,46 @@ async def resolve_url(url: str) -> str:
         # If it's a share link or redd.it link, resolve it
         if "redd.it" in url or "/s/" in url:
             resolved = False
-            for method in ["HEAD", "GET"]:
+            
+            # Step 1: Try HEAD with allow_redirects=True
+            try:
+                resp = await stealth_fetch(url, method="HEAD", allow_redirects=True)
+                if resp.url and str(resp.url) != url and "redd.it" not in str(resp.url) and "/s/" not in str(resp.url):
+                    url = str(resp.url)
+                    resolved = True
+            except Exception:
+                pass
+                
+            # Step 2: Try GET with allow_redirects=True
+            if not resolved:
                 try:
-                    resp = await stealth_fetch(url, method=method, allow_redirects=False)
-                    if resp.status_code in (301, 302, 303, 307, 308):
-                        loc = resp.headers.get("location") or resp.headers.get("Location")
-                        if loc:
-                            if loc.startswith("/"):
-                                loc = "https://www.reddit.com" + loc
-                            url = loc
-                            resolved = True
-                            break
+                    resp = await stealth_fetch(url, method="GET", allow_redirects=True)
+                    if resp.url and str(resp.url) != url and "redd.it" not in str(resp.url) and "/s/" not in str(resp.url):
+                        url = str(resp.url)
+                        resolved = True
                     elif resp.status_code == 200:
-                        pass
+                        # Parse body for canonical URL or JS redirects
+                        import re
+                        patterns = [
+                            r'<link\s+rel=["\']canonical["\']\s+href=["\']([^"\']+)["\']',
+                            r'sh-location=["\']([^"\']+)["\']',
+                            r'window\.location\.replace\([\'"]([^\'"]+)[\'"]\)',
+                            r'window\.location\s*=\s*[\'"]([^\'"]+)[\'"]'
+                        ]
+                        for pat in patterns:
+                            match = re.search(pat, resp.text)
+                            if match:
+                                url = match.group(1).replace("&amp;", "&")
+                                resolved = True
+                                break
                 except Exception:
-                    continue
+                    pass
             
             if not resolved:
                 raise ValueError("Share link could not be resolved")
+                
+            if "/s/" in url and "/comments/" not in url:
+                raise ValueError("Share link resolved to invalid URL (no /comments/ path found)")
                 
         # Normalize to old.reddit.com
         parsed = urlparse(url)
