@@ -17,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
-# Expose port 5000 (default)
-EXPOSE 5000
+# Expose port 7860
+EXPOSE 7860
 
 # Command to run the application
-CMD ["python", "-m", "bot.main"]
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860"]
