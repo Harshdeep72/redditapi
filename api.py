@@ -292,8 +292,10 @@ async def check_comment(url: str):
             "subreddit": comment_data.get("subreddit") or subreddit,
             "body_preview": body[:100] if body else None,
             "score": comment_data.get("score", 0),
+            "upvotes": comment_data.get("score", 0),
             "depth": comment_data.get("depth", 0),
             "created_utc": comment_data.get("created_utc"),
+            "createdAt": comment_data.get("created_utc"),
             "post_status": post_status,
             "error": None
         }
@@ -362,9 +364,11 @@ async def check_post(url: str):
             "subreddit": post_data.get("subreddit") or subreddit,
             "title": post_data.get("title"),
             "score": post_data.get("score", 0),
+            "upvotes": post_data.get("score", 0),
             "num_comments": post_data.get("num_comments", 0),
             "removed_by_category": removed_by,
             "created_utc": post_data.get("created_utc"),
+            "createdAt": post_data.get("created_utc"),
             "error": None
         }
         
