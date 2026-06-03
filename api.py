@@ -121,27 +121,40 @@ async def resolve_url(url: str) -> str:
     """Resolve shortlinks and normalize reddit URLs."""
     try:
         parsed = urlparse(url)
+        
+        # If it's a share link or redd.it link, resolve it
+        if "redd.it" in url or "/s/" in url:
+            resolved = False
+            for method in ["HEAD", "GET"]:
+                try:
+                    resp = await stealth_fetch(url, method=method, allow_redirects=False)
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        loc = resp.headers.get("location") or resp.headers.get("Location")
+                        if loc:
+                            if loc.startswith("/"):
+                                loc = "https://www.reddit.com" + loc
+                            url = loc
+                            resolved = True
+                            break
+                    elif resp.status_code == 200:
+                        pass
+                except Exception:
+                    continue
+            
+            if not resolved:
+                raise ValueError("Share link could not be resolved")
+                
         # Normalize to old.reddit.com
+        parsed = urlparse(url)
         if parsed.netloc in ["reddit.com", "www.reddit.com"]:
             url = url.replace(parsed.netloc, "old.reddit.com")
             
-        # If it's a share link or redd.it link, resolve it
-        if "redd.it" in url or "/s/" in url:
-            try:
-                resp = await stealth_fetch(url, method="HEAD", allow_redirects=False)
-                if resp.status_code in (301, 302) and "location" in resp.headers:
-                    loc = resp.headers["location"]
-                    if loc.startswith("/"):
-                        loc = "https://old.reddit.com" + loc
-                    loc = loc.replace("www.reddit.com", "old.reddit.com")
-                    url = loc
-            except Exception:
-                pass
-                
         # Strip query params like js_challenge, token, etc.
         parsed = urlparse(url)
         clean_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
         return clean_url
+    except ValueError as e:
+        raise e
     except Exception:
         return url
 
@@ -170,7 +183,10 @@ def walk_comment_tree(tree_list: List[Any], target_id: str) -> Optional[Dict]:
 async def check_comment(url: str):
     start_time = time.time()
     try:
-        resolved_url = await resolve_url(url)
+        try:
+            resolved_url = await resolve_url(url)
+        except ValueError as ve:
+            return Response(content=json.dumps({"status": "error", "error": str(ve)}), status_code=400, media_type="application/json")
         
         # Extract post_id and comment_id
         # Expected format: .../comments/{post_id}/title/{comment_id} or .../comments/{post_id}/_/{comment_id}
@@ -268,7 +284,10 @@ async def check_comment(url: str):
 async def check_post(url: str):
     start_time = time.time()
     try:
-        resolved_url = await resolve_url(url)
+        try:
+            resolved_url = await resolve_url(url)
+        except ValueError as ve:
+            return Response(content=json.dumps({"status": "error", "error": str(ve)}), status_code=400, media_type="application/json")
         
         match = re.search(r'/comments/([^/]+)', resolved_url)
         if not match:
