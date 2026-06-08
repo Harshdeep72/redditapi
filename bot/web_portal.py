@@ -1518,6 +1518,7 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
                 <button class="tab-btn" id="tab-btn-admin-earners" onclick="switchTab('admin-earners')">Earner Profiles</button>
                 <button class="tab-btn" id="tab-btn-admin-auditor" onclick="switchTab('tab-btn-admin-auditor')">Bulk Auditor</button>
                 <button class="tab-btn" id="tab-btn-admin-telemetry" onclick="switchTab('admin-telemetry')">Telemetry</button>
+                <button class="tab-btn" id="tab-btn-admin-checker" onclick="switchTab('admin-checker')">Link Checker</button>
             </div>
 
             <div class="user-nav-profile">
@@ -1736,6 +1737,20 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
                             <canvas id="telemetryChart" style="max-height: 180px;"></canvas>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="view-admin-checker" class="view-content">
+            <div class="card">
+                <h3>Account & Link Checker</h3>
+                <p>Paste a Reddit comment or post URL to check the liveness, extract author details, and determine account status.</p>
+                <div class="form-group" style="margin-top: 15px; display: flex; gap: 10px;">
+                    <input type="text" id="checker-url" class="input-field" placeholder="https://reddit.com/r/.../comments/..." style="flex:1;">
+                    <button class="btn btn-primary" onclick="runSingleLinkCheck()">Check Link</button>
+                </div>
+                <div id="checker-results" style="margin-top: 20px; display: none; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; border: 1px solid var(--glass-border);">
+                    <!-- Results rendered here -->
                 </div>
             </div>
         </div>
@@ -1981,6 +1996,46 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
                 }
             } catch (err) {
                 tbl.innerHTML = `<tr><td colspan="5" style="text-align:center; color:var(--color-crimson)">Scraper offline.</td></tr>`;
+            }
+        }
+
+        async function runSingleLinkCheck() {
+            const val = document.getElementById('checker-url').value.trim();
+            if (!val) {
+                showToast("Please enter a valid Reddit URL", "error");
+                return;
+            }
+            const resDiv = document.getElementById('checker-results');
+            resDiv.style.display = 'block';
+            resDiv.innerHTML = '<span style="color:var(--color-purple)">Analyzing link...</span>';
+            
+            try {
+                const res = await fetch('/api/check/link', { 
+                    method: 'POST', 
+                    headers: {'Content-Type':'application/json'}, 
+                    body: JSON.stringify({ url: val }) 
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    const r = data.result;
+                    const livenessColor = r.liveness === 'live' ? 'var(--color-green)' : 'var(--color-crimson)';
+                    const accountColor = r.account_status === 'active' ? 'var(--color-green)' : 'var(--color-crimson)';
+                    
+                    resDiv.innerHTML = `
+                        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; font-size:15px; line-height:1.6">
+                            <div><strong>Author:</strong> ${r.author ? 'u/' + r.author : '[Deleted]'}</div>
+                            <div><strong>Subreddit:</strong> r/${r.subreddit || '-'}</div>
+                            <div><strong>Content Status:</strong> <span style="color:${livenessColor}; font-weight:bold">${(r.liveness || 'Unknown').toUpperCase()}</span></div>
+                            <div><strong>Account Status:</strong> <span style="color:${accountColor}; font-weight:bold">${(r.account_status || 'Unknown').toUpperCase()}</span></div>
+                            <div><strong>Post/Comment Age:</strong> ${r.created_utc ? new Date(r.created_utc * 1000).toLocaleString() : '-'}</div>
+                            <div><strong>Last Active:</strong> ${r.last_active_utc ? new Date(r.last_active_utc * 1000).toLocaleString() : 'No recent activity / Banned'}</div>
+                        </div>
+                    `;
+                } else {
+                    resDiv.innerHTML = `<span style="color:var(--color-crimson)">Error: ${data.message || 'Unknown error'}</span>`;
+                }
+            } catch (err) {
+                resDiv.innerHTML = `<span style="color:var(--color-crimson)">Failed to contact backend.</span>`;
             }
         }
 
@@ -2792,6 +2847,83 @@ async def handle_check_comments(request: web.Request) -> web.Response:
         return web.json_response({"success": False, "message": str(exc)}, status=500)
 
 
+async def handle_check_single_link(request: web.Request) -> web.Response:
+    """Comprehensive check for a single post/comment URL for Admin Link Checker."""
+    try:
+        data = await request.json()
+        url = data.get("url", "").strip()
+        if not url:
+            return web.json_response({"success": False, "message": "No URL provided."}, status=400)
+            
+        router = get_router()
+        c_id = _extract_comment_id(url)
+        
+        author = ""
+        subreddit = ""
+        liveness = "live"
+        created_utc = None
+        
+        if c_id:
+            context = await router.get_comment_context(url)
+            if not context or not context[0]:
+                return web.json_response({"success": False, "message": "Comment not found."})
+            comment = context[0]
+            author = comment.get("author", "")
+            subreddit = comment.get("subreddit", "")
+            body = comment.get("body", "")
+            created_utc = comment.get("created_utc")
+            if author == "[deleted]" or body in ("[deleted]", "[removed]"):
+                liveness = "removed"
+        else:
+            post_data, _ = await router.get_post_and_comments(url)
+            if not post_data:
+                return web.json_response({"success": False, "message": "Post not found."})
+            author = post_data.get("author", "")
+            subreddit = post_data.get("subreddit", "")
+            selftext = post_data.get("selftext", "")
+            created_utc = post_data.get("created_utc")
+            if author == "[deleted]" or selftext in ("[deleted]", "[removed]"):
+                liveness = "removed"
+                
+        account_status = "active"
+        last_active_utc = None
+        
+        if author and author != "[deleted]":
+            about = await router.get_user_about(author)
+            if not about:
+                account_status = "banned_or_shadowbanned"
+            else:
+                is_suspended = about.get("is_suspended", False)
+                if is_suspended:
+                    account_status = "suspended"
+                else:
+                    try:
+                        comments = await router.get_user_comments(author)
+                        posts = await router.get_user_posts(author)
+                        all_items = comments + posts
+                        if all_items:
+                            last_active_utc = max(item.get("created_utc", 0) for item in all_items)
+                    except Exception as e:
+                        logger.warning("Could not fetch user activity: %s", e)
+        else:
+            account_status = "deleted"
+            
+        return web.json_response({
+            "success": True, 
+            "result": {
+                "author": author,
+                "subreddit": subreddit,
+                "liveness": liveness,
+                "created_utc": created_utc,
+                "account_status": account_status,
+                "last_active_utc": last_active_utc
+            }
+        })
+    except Exception as exc:
+        logger.error("Error checking single link: %s", exc)
+        return web.json_response({"success": False, "message": str(exc)}, status=500)
+
+
 # ─── EXTERNAL API INTEGRATIONS ────────────────────────────────────────────────
 
 async def handle_external_check_user(request: web.Request) -> web.Response:
@@ -3051,6 +3183,7 @@ async def start_web_server(bot: commands.Bot) -> None:
     app.router.add_post("/api/check/users", handle_check_users)
     app.router.add_post("/api/check/posts", handle_check_posts)
     app.router.add_post("/api/check/comments", handle_check_comments)
+    app.router.add_post("/api/check/link", handle_check_single_link)
 
     # External Integration API Endpoints
     app.router.add_get("/api/external/check/user/{username}", handle_external_check_user)
