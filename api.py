@@ -387,7 +387,7 @@ async def check_post(url: str):
 
 
 @app.get("/api/external/check/account")
-async def check_account(username: str):
+async def check_account(username: str, include_activity: bool = False):
     start_time = time.time()
     try:
         username = username.lstrip("u/").split("/")[-1]
@@ -404,12 +404,26 @@ async def check_account(username: str):
             is_suspended = user_data.get("is_suspended", False)
             status = "suspended" if is_suspended else "active"
             
+            last_active_utc = None
+            if include_activity and status == "active":
+                try:
+                    overview_url = f"https://old.reddit.com/user/{username}/.json?limit=1&raw_json=1"
+                    overview_resp = await stealth_fetch(overview_url)
+                    if overview_resp.status_code == 200:
+                        overview_data = overview_resp.json()
+                        children = overview_data.get("data", {}).get("children", [])
+                        if children:
+                            last_active_utc = children[0].get("data", {}).get("created_utc")
+                except Exception:
+                    pass
+            
             result = {
                 "status": status,
                 "username": user_data.get("name", username),
                 "total_karma": user_data.get("total_karma", 0),
                 "created_utc": user_data.get("created_utc"),
                 "avatar_url": user_data.get("icon_img"),
+                "last_active_utc": last_active_utc,
                 "error": None
             }
             print(f"[ACCOUNT] {username} -> {status} ({int((time.time() - start_time)*1000)}ms)")
@@ -433,6 +447,7 @@ async def check_account(username: str):
                 "total_karma": 0,
                 "created_utc": None,
                 "avatar_url": None,
+                "last_active_utc": None,
                 "error": None
             }
             
