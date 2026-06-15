@@ -373,7 +373,12 @@ async def check_post(url: str):
         }
         
         # Backward compatibility aliases for the Node.js bot
-        result["liveness"] = status if status not in ("active", "spam") else "live"
+        if status in ("active"):
+            result["liveness"] = "live"
+        elif status in ("spam", "removed"):
+            result["liveness"] = "removed"
+        else:
+            result["liveness"] = status
         
         http_status = 200 if status == "active" else 404
         print(f"[POST] {post_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
