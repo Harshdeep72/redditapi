@@ -17,6 +17,7 @@ PROXY_FILE = "proxies.txt"
 PROXIES: List[str] = []
 PROXY_FAILURES: Dict[str, int] = {}
 MAX_PROXY_FAILURES = 3
+FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "total_miss": 0}
 
 def load_proxies():
     global PROXIES
@@ -60,6 +61,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
     headers = {
         "Accept": "application/json, text/html",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, br",
     }
     
     cookie = os.environ.get("REDDIT_SESSION_COOKIE")
@@ -229,8 +231,8 @@ async def check_comment(url: str):
         sub_match = re.search(r'/r/([^/]+)', resolved_url)
         subreddit = sub_match.group(1) if sub_match else "all"
         
-        # Initial Fetch
-        fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1"
+        # Initial Fetch (Narrow)
+        fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=0&limit=1"
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
@@ -260,16 +262,25 @@ async def check_comment(url: str):
         comment_tree = data[1]["data"]["children"]
         comment_data = walk_comment_tree(comment_tree, comment_id)
         
-        if not comment_data:
-            # Fallback with context=0
-            fetch_url_ctx = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=0"
+        if comment_data:
+            FALLBACK_STATS["narrow_hit"] += 1
+        else:
+            FALLBACK_STATS["fallback_fired"] += 1
+            print(f"[FALLBACK_FIRED] {comment_id} — narrow fetch (limit=1,context=0) missed target, retrying wide")
+            
+            # Fallback (Wide)
+            fetch_url_ctx = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1"
             try:
                 resp2 = await stealth_fetch(fetch_url_ctx)
                 if resp2.status_code == 200:
                     data2 = resp2.json()
                     comment_data = walk_comment_tree(data2[1]["data"]["children"], comment_id)
+                    if comment_data:
+                        FALLBACK_STATS["fallback_hit"] += 1
+                    else:
+                        FALLBACK_STATS["total_miss"] += 1
             except Exception:
-                pass
+                FALLBACK_STATS["total_miss"] += 1
                 
         if not comment_data:
             return Response(
@@ -467,3 +478,12 @@ async def check_account(username: str, include_activity: bool = False):
     except Exception as e:
         return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=500, media_type="application/json")
 
+
+@app.get("/api/external/stats/fallback")
+async def fallback_stats():
+    total = FALLBACK_STATS["narrow_hit"] + FALLBACK_STATS["fallback_fired"]
+    rate = (FALLBACK_STATS["fallback_fired"] / total * 100) if total else 0
+    return Response(
+        content=json.dumps({**FALLBACK_STATS, "total_requests": total, "fallback_rate_pct": round(rate, 2)}),
+        status_code=200, media_type="application/json"
+    )
