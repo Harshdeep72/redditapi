@@ -19,6 +19,13 @@ PROXY_FAILURES: Dict[str, int] = {}
 MAX_PROXY_FAILURES = 4  # Raised so a noisy proxy doesn't exhaust the pool too fast
 FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "total_miss": 0}
 
+# Set PROXY_ENABLED=false in HF Space env vars to skip proxy entirely and go
+# direct on every request.  Useful when the proxy port is firewalled by the
+# hosting provider (e.g. port 823 is blocked from Hugging Face).
+_PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+if not _PROXY_ENABLED:
+    print("[PROXY] PROXY_ENABLED=false — all requests will go direct (no proxy).")
+
 # -----------------------------------------------------------------------
 # Two-tier concurrency control:
 #
@@ -162,7 +169,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         # ------------------------------------------------------------------ #
         # Phase 1 — Proxy-first attempts  (skip if circuit breaker is open)  #
         # ------------------------------------------------------------------ #
-        if PROXIES and not _is_circuit_open():
+        if _PROXY_ENABLED and PROXIES and not _is_circuit_open():
             for attempt in range(MAX_RETRIES):
                 if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
                     print(f"[PROXY] Majority of proxies unhealthy — resetting failure counters (attempt {attempt+1})")
@@ -272,7 +279,7 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
 
         all_timed_out = True
 
-        if PROXIES and not _is_circuit_open():
+        if _PROXY_ENABLED and PROXIES and not _is_circuit_open():
             for attempt in range(MAX_RETRIES):
                 if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
                     PROXY_FAILURES.clear()
@@ -1002,6 +1009,7 @@ async def health():
     return Response(
         content=json.dumps({
             "status": "ok",
+            "proxy_enabled": _PROXY_ENABLED,
             "proxy_total": len(PROXIES),
             "proxy_healthy": len(healthy),
             "proxy_failures": {k: v for k, v in PROXY_FAILURES.items() if v > 0},
