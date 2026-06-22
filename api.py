@@ -62,6 +62,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         "Accept": "application/json, text/html",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, br",
+        "Connection": "close",
     }
     
     cookie = os.environ.get("REDDIT_SESSION_COOKIE")
@@ -108,6 +109,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
                     last_err = f"Proxy blocked (HTTP {resp.status_code})"
+                    await asyncio.sleep(random.uniform(1.0, 2.5))
                     continue
                     
                 # Success or standard error like 404
