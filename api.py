@@ -34,14 +34,15 @@ if not _PROXY_ENABLED:
 #    called by the automated liveness / hold-end checker.  These are
 #    NEVER starved, even during a heavy Inspector bulk run.
 #
-#  _BULK_SEMAPHORE (3 slots):
+#  _BULK_SEMAPHORE (20 slots):
 #    Used by /api/external/bulk/check — the batch endpoint called by the
 #    Reddit Inspector.  8 parallel fetches inside a single batch request
 #    means 500 URLs ≈ 25 HTTP round-trips instead of 500, making the
 #    Inspector fast while keeping the priority lane clear.
+#    Massive concurrency for DataImpulse residential proxies (rotates per connection).
 # -----------------------------------------------------------------------
 _PRIORITY_SEMAPHORE = asyncio.Semaphore(3)
-_BULK_SEMAPHORE     = asyncio.Semaphore(3)
+_BULK_SEMAPHORE     = asyncio.Semaphore(20)
 
 # -----------------------------------------------------------------------
 # Proxy circuit breaker
