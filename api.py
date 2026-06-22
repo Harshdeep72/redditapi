@@ -221,7 +221,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     await asyncio.sleep(sleep_s)
 
                 try:
-                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
+                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as session:
                         resp = await session.request(
                             method=method,
                             url=url,
@@ -331,7 +331,7 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
                     await asyncio.sleep(sleep_s)
 
                 try:
-                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
+                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as session:
                         resp = await session.request(
                             method=method, url=url, headers=headers,
                             allow_redirects=allow_redirects, timeout=PROXY_TIMEOUT,
