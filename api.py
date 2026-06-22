@@ -137,6 +137,12 @@ def load_proxies():
         except Exception as e:
             print(f"[PROXY] WARNING: Could not fetch PROXY_LIST_URL: {e}")
 
+    # Source 3: PROXY_STRING — a direct rotating proxy string (e.g., DataImpulse gateway)
+    proxy_string = os.environ.get("PROXY_STRING", "").strip()
+    if proxy_string:
+        lines.append(proxy_string)
+        print("[PROXY] Loaded single rotating gateway from PROXY_STRING.")
+
     PROXIES = _parse_proxy_lines(lines)
     print(f"Loaded {len(PROXIES)} proxies total.")
 
