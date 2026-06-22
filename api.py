@@ -480,6 +480,23 @@ async def check_account(username: str, include_activity: bool = False):
         return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=500, media_type="application/json")
 
 
+
+@app.get("/api/external/proxy/json")
+async def proxy_json(url: str):
+    start_time = time.time()
+    try:
+        resp = await stealth_fetch(url)
+        if resp.status_code == 200:
+            print(f"[PROXY_JSON] 200 OK ({int((time.time() - start_time)*1000)}ms)")
+            return Response(content=resp.text, status_code=200, media_type="application/json")
+        else:
+            print(f"[PROXY_JSON] {resp.status_code} ({int((time.time() - start_time)*1000)}ms)")
+            return Response(content=resp.text, status_code=resp.status_code, media_type="application/json")
+    except Exception as e:
+        print(f"[PROXY_JSON] ERROR: {str(e)}")
+        return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=403, media_type="application/json")
+
+
 @app.get("/api/external/stats/fallback")
 async def fallback_stats():
     total = FALLBACK_STATS["narrow_hit"] + FALLBACK_STATS["fallback_fired"]
