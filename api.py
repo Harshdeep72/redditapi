@@ -95,30 +95,53 @@ def _record_proxy_success() -> None:
     _PROXY_CONSECUTIVE_TIMEOUTS = 0
 
 
+def _parse_proxy_lines(lines: list) -> list:
+    """Parse raw proxy strings into normalised http://user:pw@host:port URLs."""
+    formatted = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.replace("http://", "").replace("https://", "").replace("socks5://", "")
+        if "@" in line:
+            formatted.append(f"http://{line}")
+            continue
+        parts = line.split(":")
+        if len(parts) >= 4:
+            host, port, user, pw = parts[:4]
+            formatted.append(f"http://{user}:{pw}@{host}:{port}")
+        else:
+            formatted.append(f"http://{line}")
+    return formatted
+
+
 def load_proxies():
+    """Load proxies from proxies.txt and/or PROXY_LIST_URL env var (one proxy per line)."""
     global PROXIES
+    lines = []
+
+    # Source 1: local proxies.txt
     if os.path.exists(PROXY_FILE):
         with open(PROXY_FILE, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
-        
-        formatted = []
-        for line in lines:
-            line = line.replace("http://", "").replace("https://", "").replace("socks5://", "")
-            if "@" in line:
-                formatted.append(f"http://{line}")
-                continue
-                
-            parts = line.split(":")
-            if len(parts) >= 4:
-                host, port, user, pw = parts[:4]
-                formatted.append(f"http://{user}:{pw}@{host}:{port}")
-            else:
-                formatted.append(f"http://{line}")
-                
-        PROXIES = formatted
-        print(f"Loaded {len(PROXIES)} proxies.")
+            lines += [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+
+    # Source 2: PROXY_LIST_URL — fetches one proxy per line from a remote URL
+    proxy_list_url = os.environ.get("PROXY_LIST_URL", "").strip()
+    if proxy_list_url:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(proxy_list_url, timeout=10) as resp:
+                remote_lines = resp.read().decode("utf-8").splitlines()
+            lines += [l.strip() for l in remote_lines if l.strip() and not l.strip().startswith("#")]
+            print(f"[PROXY] Fetched {len(remote_lines)} lines from PROXY_LIST_URL.")
+        except Exception as e:
+            print(f"[PROXY] WARNING: Could not fetch PROXY_LIST_URL: {e}")
+
+    PROXIES = _parse_proxy_lines(lines)
+    print(f"Loaded {len(PROXIES)} proxies total.")
 
 load_proxies()
+
 
 def get_healthy_proxy() -> Optional[str]:
     if not PROXIES:
@@ -1023,6 +1046,7 @@ async def health():
             "status": "ok",
             "proxy_enabled": _PROXY_ENABLED,
             "session_cookie_set": bool(os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")),
+            "proxy_list_url_set": bool(os.environ.get("PROXY_LIST_URL", "").strip()),
             "proxy_total": len(PROXIES),
             "proxy_healthy": len(healthy),
             "proxy_failures": {k: v for k, v in PROXY_FAILURES.items() if v > 0},
@@ -1030,6 +1054,22 @@ async def health():
             "proxy_circuit_resets_in_secs": circuit_resets_in,
             "proxy_consecutive_timeouts": _PROXY_CONSECUTIVE_TIMEOUTS,
             "fallback_stats": FALLBACK_STATS,
+        }),
+        status_code=200, media_type="application/json"
+    )
+
+
+@app.post("/reload-proxies")
+async def reload_proxies_endpoint():
+    """Reload proxy list from proxies.txt + PROXY_LIST_URL without restarting."""
+    old_count = len(PROXIES)
+    PROXY_FAILURES.clear()
+    load_proxies()
+    return Response(
+        content=json.dumps({
+            "status": "reloaded",
+            "proxies_before": old_count,
+            "proxies_after": len(PROXIES),
         }),
         status_code=200, media_type="application/json"
     )
