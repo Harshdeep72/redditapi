@@ -36,6 +36,58 @@ FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "tota
 _PRIORITY_SEMAPHORE = asyncio.Semaphore(3)
 _BULK_SEMAPHORE     = asyncio.Semaphore(8)
 
+# -----------------------------------------------------------------------
+# Proxy circuit breaker
+#
+# When every proxy attempt in a single stealth_fetch call times out we
+# increment _PROXY_CONSECUTIVE_TIMEOUTS.  After CIRCUIT_BREAKER_THRESHOLD
+# consecutive all-timeout cycles the circuit "opens": subsequent calls
+# skip the proxy phase entirely and go straight to the direct fallback.
+# The circuit resets after CIRCUIT_RESET_SECS seconds so we keep retrying
+# the proxy periodically rather than giving up forever.
+#
+# This turns the 74-second worst-case (6 × 10s + 14s direct) into
+# ~14 seconds (direct only) whenever the DataImpulse gateway is down.
+# -----------------------------------------------------------------------
+CIRCUIT_BREAKER_THRESHOLD = 2   # consecutive all-timeout cycles before opening
+CIRCUIT_RESET_SECS = 300        # 5 minutes
+_PROXY_CONSECUTIVE_TIMEOUTS = 0
+_PROXY_CIRCUIT_OPEN_UNTIL   = 0.0  # epoch seconds; 0 = closed
+
+# Maximum bytes to read per Reddit response (400 KB).
+# Reddit JSON is gzip-compressed, so 400 KB covers every realistic payload
+# while protecting against accidentally downloading a huge thread.
+MAX_RESPONSE_BYTES = 400 * 1024
+
+
+def _is_circuit_open() -> bool:
+    """Return True if the proxy circuit breaker is open (skip proxy)."""
+    global _PROXY_CIRCUIT_OPEN_UNTIL
+    if _PROXY_CIRCUIT_OPEN_UNTIL and time.time() < _PROXY_CIRCUIT_OPEN_UNTIL:
+        return True
+    if _PROXY_CIRCUIT_OPEN_UNTIL:
+        # Timer expired — reset so we try proxy again
+        _PROXY_CIRCUIT_OPEN_UNTIL = 0.0
+    return False
+
+
+def _record_proxy_all_timeout() -> None:
+    """Called when every proxy attempt in one stealth_fetch cycle timed out."""
+    global _PROXY_CONSECUTIVE_TIMEOUTS, _PROXY_CIRCUIT_OPEN_UNTIL
+    _PROXY_CONSECUTIVE_TIMEOUTS += 1
+    if _PROXY_CONSECUTIVE_TIMEOUTS >= CIRCUIT_BREAKER_THRESHOLD:
+        _PROXY_CIRCUIT_OPEN_UNTIL = time.time() + CIRCUIT_RESET_SECS
+        print(f"[CIRCUIT] Proxy circuit OPEN — skipping proxy for {CIRCUIT_RESET_SECS}s "
+              f"({_PROXY_CONSECUTIVE_TIMEOUTS} consecutive all-timeout cycles)")
+        _PROXY_CONSECUTIVE_TIMEOUTS = 0
+
+
+def _record_proxy_success() -> None:
+    """Called on a successful proxy fetch — resets the circuit breaker counter."""
+    global _PROXY_CONSECUTIVE_TIMEOUTS
+    _PROXY_CONSECUTIVE_TIMEOUTS = 0
+
+
 def load_proxies():
     global PROXIES
     if os.path.exists(PROXY_FILE):
@@ -78,17 +130,18 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
     Strategy (proxy-first):
       - Skip the direct (no-proxy) attempt entirely; Hugging Face egress IPs are
         permanently blocked by Reddit / Cloudflare.
-      - Try up to MAX_RETRIES proxy attempts with exponential back-off.
-      - If more than half the proxies are marked unhealthy, clear the failure
-        counters mid-run so we don't exhaust the pool on a single request.
-      - Only fall back to a direct attempt as a last resort (useful for non-Reddit
-        URLs that don't block HF IPs, e.g. redd.it share-link resolution).
+      - Try up to MAX_RETRIES proxy attempts.
+      - Circuit breaker: if multiple consecutive all-timeout cycles are detected
+        the proxy is bypassed entirely for CIRCUIT_RESET_SECS (default 5 min)
+        so we fall straight to direct instead of waiting 3 × 5s = 15s.
+      - Only fall back to a direct attempt as a last resort.
 
     The _PRIORITY_SEMAPHORE limits concurrent calls to 3 slots reserved
     exclusively for liveness checks — they are NEVER blocked by the inspector.
     """
     async with _PRIORITY_SEMAPHORE:
-        MAX_RETRIES = 6  # More retries so rotating proxies have a real chance
+        MAX_RETRIES = 3     # 3 attempts × 5s timeout = 15s max proxy wait
+        PROXY_TIMEOUT = 5.0 # Fail fast — rotating proxy should connect in <3s
         last_err = None
 
         # Build headers once
@@ -104,93 +157,107 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         if cookie:
             headers["Cookie"] = f"reddit_session={cookie}"
 
+        all_timed_out = True  # track whether every attempt was a timeout
+
         # ------------------------------------------------------------------ #
-        # Phase 1 — Proxy-first attempts                                       #
+        # Phase 1 — Proxy-first attempts  (skip if circuit breaker is open)  #
         # ------------------------------------------------------------------ #
-        for attempt in range(MAX_RETRIES):
-            # Mid-run pool rescue: if >50 % of proxies are marked bad, reset so
-            # we don't fall through to the exception on the last attempt.
-            if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
-                print(f"[PROXY] Majority of proxies unhealthy — resetting failure counters (attempt {attempt+1})")
-                PROXY_FAILURES.clear()
+        if PROXIES and not _is_circuit_open():
+            for attempt in range(MAX_RETRIES):
+                if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
+                    print(f"[PROXY] Majority of proxies unhealthy — resetting failure counters (attempt {attempt+1})")
+                    PROXY_FAILURES.clear()
 
-            proxy = get_healthy_proxy()
-            proxies_config = {"http": proxy, "https": proxy} if proxy else None
+                proxy = get_healthy_proxy()
+                proxies_config = {"http": proxy, "https": proxy} if proxy else None
 
-            # Back-off: 0.5s → 1s → 2s → 3s … capped at 5s
-            if attempt > 0:
-                sleep_s = min(0.5 * (2 ** (attempt - 1)), 5.0) + random.uniform(0, 0.5)
-                await asyncio.sleep(sleep_s)
+                # Only back-off when there are multiple proxies to rotate between.
+                # With a single proxy, sleeping just wastes time.
+                if attempt > 0 and len(PROXIES) > 1:
+                    sleep_s = min(0.3 * (2 ** (attempt - 1)), 2.0) + random.uniform(0, 0.3)
+                    await asyncio.sleep(sleep_s)
 
-            try:
-                async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
-                    resp = await session.request(
-                        method=method,
-                        url=url,
-                        headers=headers,
-                        allow_redirects=allow_redirects,
-                        timeout=10.0,
+                try:
+                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
+                        resp = await session.request(
+                            method=method,
+                            url=url,
+                            headers=headers,
+                            allow_redirects=allow_redirects,
+                            timeout=PROXY_TIMEOUT,
+                        )
+
+                    body_lower = resp.text[:2000].lower() if resp.text else ""
+                    is_blocked = (
+                        resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
+                        or "challenge platform" in body_lower
+                        or "just a moment" in body_lower
+                        or "access denied" in body_lower
+                        or "enable javascript" in body_lower
                     )
 
-                body_lower = resp.text.lower() if resp.text else ""
-                is_blocked = (
-                    resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
-                    or "challenge platform" in body_lower
-                    or "just a moment" in body_lower
-                    or "access denied" in body_lower
-                    or "enable javascript" in body_lower
-                )
+                    if is_blocked:
+                        if proxy:
+                            PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+                        last_err = f"Proxy blocked (HTTP {resp.status_code})"
+                        print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} blocked via {proxy}: HTTP {resp.status_code}")
+                        all_timed_out = False  # blocked is different from timed out
+                        continue
 
-                if is_blocked:
+                    # ✅ Success
+                    if proxy:
+                        PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+                    _record_proxy_success()
+                    return resp
+
+                except Exception as e:
+                    err_str = str(e)
+                    is_timeout = "timeout" in err_str.lower() or "timed out" in err_str.lower() or "28" in err_str
+                    if not is_timeout:
+                        all_timed_out = False
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                    last_err = f"Proxy blocked (HTTP {resp.status_code})"
-                    print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} blocked via {proxy}: HTTP {resp.status_code}")
-                    continue
+                    last_err = f"Proxy error: {type(e).__name__}: {e}"
+                    print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} error via {proxy}: {last_err}")
 
-                # ✅ Success (200, 404, etc. are valid non-blocked responses)
-                if proxy:
-                    PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
-                return resp
-
-            except Exception as e:
-                if proxy:
-                    PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                last_err = f"Proxy error: {type(e).__name__}: {e}"
-                print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} error via {proxy}: {last_err}")
+            # All proxy attempts done
+            if all_timed_out:
+                _record_proxy_all_timeout()
+        else:
+            if _is_circuit_open():
+                print(f"[CIRCUIT] Proxy circuit open — skipping proxy, going direct immediately")
 
         # ------------------------------------------------------------------ #
         # Phase 2 — Last-resort direct attempt (no proxy)                     #
-        # Useful for non-Reddit URLs (share-link redirects, redd.it, etc.)   #
         # ------------------------------------------------------------------ #
         try:
-            print(f"[PROXY] All {MAX_RETRIES} proxy attempts failed. Trying direct as last resort.")
+            print(f"[PROXY] Trying direct fetch.")
             async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
                 resp = await session.request(
                     method=method,
                     url=url,
                     headers=headers,
                     allow_redirects=allow_redirects,
-                    timeout=8.0,
+                    timeout=12.0,
                 )
-            body_lower = resp.text.lower() if resp.text else ""
+            body_lower = resp.text[:2000].lower() if resp.text else ""
             if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
                 return resp
             last_err = f"Direct also blocked (HTTP {resp.status_code})"
         except Exception as e:
             last_err = f"Direct error: {type(e).__name__}: {e}"
 
-        raise Exception(f"All proxy attempts + direct fallback failed. Last error: {last_err}")
+        raise Exception(f"All fetch attempts failed. Last error: {last_err}")
 
 
 async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
     """
-    Same as stealth_fetch but uses _BULK_SEMAPHORE (8 slots) instead of
-    _PRIORITY_SEMAPHORE.  Used exclusively by the /bulk/check endpoint so
-    that Inspector runs never compete with liveness checks for semaphore slots.
+    Same as stealth_fetch but uses _BULK_SEMAPHORE (8 slots) and a reduced
+    retry budget for speed.  Used exclusively by the /bulk/check endpoint.
     """
     async with _BULK_SEMAPHORE:
-        MAX_RETRIES = 4  # Fewer retries in bulk mode — speed > thoroughness
+        MAX_RETRIES = 2     # Speed > thoroughness in bulk mode
+        PROXY_TIMEOUT = 5.0
         last_err = None
 
         headers = {
@@ -203,43 +270,73 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
         if cookie:
             headers["Cookie"] = f"reddit_session={cookie}"
 
-        for attempt in range(MAX_RETRIES):
-            if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
-                PROXY_FAILURES.clear()
+        all_timed_out = True
 
-            proxy = get_healthy_proxy()
-            proxies_config = {"http": proxy, "https": proxy} if proxy else None
+        if PROXIES and not _is_circuit_open():
+            for attempt in range(MAX_RETRIES):
+                if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
+                    PROXY_FAILURES.clear()
 
-            if attempt > 0:
-                sleep_s = min(0.3 * (2 ** (attempt - 1)), 3.0) + random.uniform(0, 0.3)
-                await asyncio.sleep(sleep_s)
+                proxy = get_healthy_proxy()
+                proxies_config = {"http": proxy, "https": proxy} if proxy else None
 
-            try:
-                async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
-                    resp = await session.request(
-                        method=method, url=url, headers=headers,
-                        allow_redirects=allow_redirects, timeout=8.0,
+                if attempt > 0 and len(PROXIES) > 1:
+                    sleep_s = min(0.2 * (2 ** (attempt - 1)), 1.0) + random.uniform(0, 0.2)
+                    await asyncio.sleep(sleep_s)
+
+                try:
+                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
+                        resp = await session.request(
+                            method=method, url=url, headers=headers,
+                            allow_redirects=allow_redirects, timeout=PROXY_TIMEOUT,
+                        )
+                    body_lower = resp.text[:2000].lower() if resp.text else ""
+                    is_blocked = (
+                        resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
+                        or "challenge platform" in body_lower
+                        or "just a moment" in body_lower
                     )
-                body_lower = resp.text.lower() if resp.text else ""
-                is_blocked = (
-                    resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
-                    or "challenge platform" in body_lower
-                    or "just a moment" in body_lower
-                )
-                if is_blocked:
+                    if is_blocked:
+                        if proxy:
+                            PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+                        last_err = f"Blocked (HTTP {resp.status_code})"
+                        all_timed_out = False
+                        continue
+                    if proxy:
+                        PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+                    _record_proxy_success()
+                    return resp
+                except Exception as e:
+                    err_str = str(e)
+                    if "timeout" not in err_str.lower() and "timed out" not in err_str.lower() and "28" not in err_str:
+                        all_timed_out = False
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                    last_err = f"Blocked (HTTP {resp.status_code})"
-                    continue
-                if proxy:
-                    PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+                    last_err = f"Proxy error: {type(e).__name__}: {e}"
+
+            if all_timed_out:
+                _record_proxy_all_timeout()
+        else:
+            if _is_circuit_open():
+                pass  # already logged in stealth_fetch; keep logs clean
+
+        # Direct fallback
+        try:
+            async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
+                resp = await session.request(
+                    method=method, url=url, headers=headers,
+                    allow_redirects=allow_redirects, timeout=10.0,
+                )
+            body_lower = resp.text[:2000].lower() if resp.text else ""
+            if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
                 return resp
-            except Exception as e:
-                if proxy:
-                    PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                last_err = f"Proxy error: {type(e).__name__}: {e}"
+            last_err = f"Direct also blocked (HTTP {resp.status_code})"
+        except Exception as e:
+            last_err = f"Direct error: {type(e).__name__}: {e}"
 
         raise Exception(f"Bulk fetch failed. Last error: {last_err}")
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -900,12 +997,17 @@ async def reload_proxies_endpoint():
 async def health():
     """Quick health check — confirms the API is up and reports proxy pool size."""
     healthy = [p for p in PROXIES if PROXY_FAILURES.get(p, 0) < MAX_PROXY_FAILURES]
+    circuit_open = _is_circuit_open()
+    circuit_resets_in = max(0, int(_PROXY_CIRCUIT_OPEN_UNTIL - time.time())) if circuit_open else 0
     return Response(
         content=json.dumps({
             "status": "ok",
             "proxy_total": len(PROXIES),
             "proxy_healthy": len(healthy),
             "proxy_failures": {k: v for k, v in PROXY_FAILURES.items() if v > 0},
+            "proxy_circuit_open": circuit_open,
+            "proxy_circuit_resets_in_secs": circuit_resets_in,
+            "proxy_consecutive_timeouts": _PROXY_CONSECUTIVE_TIMEOUTS,
             "fallback_stats": FALLBACK_STATS,
         }),
         status_code=200, media_type="application/json"
