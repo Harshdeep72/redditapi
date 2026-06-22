@@ -182,8 +182,8 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
     exclusively for liveness checks — they are NEVER blocked by the inspector.
     """
     async with _PRIORITY_SEMAPHORE:
-        MAX_RETRIES = 3     # 3 attempts × 5s timeout = 15s max proxy wait
-        PROXY_TIMEOUT = 5.0 # Fail fast — rotating proxy should connect in <3s
+        MAX_RETRIES = 3     # 3 attempts × 12s timeout
+        PROXY_TIMEOUT = 12.0 # Residential proxies (DataImpulse) are often slow, give them 12s
         last_err = None
 
         # Build headers once
@@ -260,6 +260,8 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
                     last_err = f"Proxy error: {type(e).__name__}: {e}"
+                    print(f"[PROXY DEBUG] Bulk proxy fetch failed: {last_err}")
+                    print(f"[PROXY DEBUG] Bulk proxy fetch failed: {last_err}")
                     print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} error via {proxy}: {last_err}")
 
             # All proxy attempts done
@@ -300,7 +302,7 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
     """
     async with _BULK_SEMAPHORE:
         MAX_RETRIES = 2     # Speed > thoroughness in bulk mode
-        PROXY_TIMEOUT = 5.0
+        PROXY_TIMEOUT = 12.0 # Residential proxies are slow
         last_err = None
 
         headers = {
