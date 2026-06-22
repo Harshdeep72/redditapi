@@ -16,7 +16,7 @@ app = FastAPI()
 PROXY_FILE = "proxies.txt"
 PROXIES: List[str] = []
 PROXY_FAILURES: Dict[str, int] = {}
-MAX_PROXY_FAILURES = 3
+MAX_PROXY_FAILURES = 4  # Raised so a noisy proxy doesn't exhaust the pool too fast
 FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "total_miss": 0}
 
 def load_proxies():
@@ -55,73 +55,111 @@ def get_healthy_proxy() -> Optional[str]:
     return random.choice(healthy)
 
 async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
-    max_retries = 3
+    """
+    Fetch a URL with rotating residential proxies.
+
+    Strategy (proxy-first):
+      - Skip the direct (no-proxy) attempt entirely; Hugging Face egress IPs are
+        permanently blocked by Reddit / Cloudflare.
+      - Try up to MAX_RETRIES proxy attempts with exponential back-off.
+      - If more than half the proxies are marked unhealthy, clear the failure
+        counters mid-run so we don't exhaust the pool on a single request.
+      - Only fall back to a direct attempt as a last resort (useful for non-Reddit
+        URLs that don't block HF IPs, e.g. redd.it share-link resolution).
+    """
+    MAX_RETRIES = 6  # More retries so rotating proxies have a real chance
     last_err = None
-    
+
+    # Build headers once
     headers = {
-        "Accept": "application/json, text/html",
+        "Accept": "application/json, text/html, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, br",
+        "Accept-Encoding": "gzip, deflate, br",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     }
-    
-    cookie = os.environ.get("REDDIT_SESSION_COOKIE")
+
+    # Attach Reddit session cookie when available
+    cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
     if cookie:
         headers["Cookie"] = f"reddit_session={cookie}"
 
-    # Attempt 1: Direct request without proxy
-    try:
-        async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
-            resp = await session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                allow_redirects=allow_redirects,
-                timeout=5.0
-            )
-            
-            # If not blocked, return immediately
-            if resp.status_code not in (403, 429) and "challenge platform" not in resp.text.lower() and "just a moment" not in resp.text.lower():
-                return resp
-                
-            last_err = f"Direct request blocked (HTTP {resp.status_code})"
-    except Exception as e:
-        last_err = f"Direct request error: {str(e)}"
+    # ------------------------------------------------------------------ #
+    # Phase 1 — Proxy-first attempts                                       #
+    # ------------------------------------------------------------------ #
+    for attempt in range(MAX_RETRIES):
+        # Mid-run pool rescue: if >50 % of proxies are marked bad, reset so
+        # we don't fall through to the exception on the last attempt.
+        if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
+            print(f"[PROXY] Majority of proxies unhealthy — resetting failure counters (attempt {attempt+1})")
+            PROXY_FAILURES.clear()
 
-    # Attempt 2+: Use proxies
-    for attempt in range(max_retries):
         proxy = get_healthy_proxy()
         proxies_config = {"http": proxy, "https": proxy} if proxy else None
-        
+
+        # Back-off: 0.5s → 1s → 2s → 3s … capped at 5s
+        if attempt > 0:
+            sleep_s = min(0.5 * (2 ** (attempt - 1)), 5.0) + random.uniform(0, 0.5)
+            await asyncio.sleep(sleep_s)
+
         try:
-            # We use AsyncSession for async curl_cffi requests
             async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
                 resp = await session.request(
                     method=method,
                     url=url,
                     headers=headers,
                     allow_redirects=allow_redirects,
-                    timeout=6.0
+                    timeout=10.0,
                 )
-                
-                # Check for Cloudflare / block signals
-                if resp.status_code in (403, 429) or "challenge platform" in resp.text.lower() or "just a moment" in resp.text.lower():
-                    if proxy:
-                        PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                    last_err = f"Proxy blocked (HTTP {resp.status_code})"
-                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                    continue
-                    
-                # Success or standard error like 404
+
+            body_lower = resp.text.lower() if resp.text else ""
+            is_blocked = (
+                resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
+                or "challenge platform" in body_lower
+                or "just a moment" in body_lower
+                or "access denied" in body_lower
+                or "enable javascript" in body_lower
+            )
+
+            if is_blocked:
                 if proxy:
-                    PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
-                return resp
-                
+                    PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+                last_err = f"Proxy blocked (HTTP {resp.status_code})"
+                print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} blocked via {proxy}: HTTP {resp.status_code}")
+                continue
+
+            # ✅ Success (200, 404, etc. are valid non-blocked responses)
+            if proxy:
+                PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+            return resp
+
         except Exception as e:
             if proxy:
                 PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-            last_err = f"Proxy error: {str(e)}"
-            
-    raise Exception(f"Direct + {max_retries} proxy attempts failed. Last error: {last_err}")
+            last_err = f"Proxy error: {type(e).__name__}: {e}"
+            print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} error via {proxy}: {last_err}")
+
+    # ------------------------------------------------------------------ #
+    # Phase 2 — Last-resort direct attempt (no proxy)                     #
+    # Useful for non-Reddit URLs (share-link redirects, redd.it, etc.)   #
+    # ------------------------------------------------------------------ #
+    try:
+        print(f"[PROXY] All {MAX_RETRIES} proxy attempts failed. Trying direct as last resort.")
+        async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
+            resp = await session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                allow_redirects=allow_redirects,
+                timeout=8.0,
+            )
+        body_lower = resp.text.lower() if resp.text else ""
+        if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
+            return resp
+        last_err = f"Direct also blocked (HTTP {resp.status_code})"
+    except Exception as e:
+        last_err = f"Direct error: {type(e).__name__}: {e}"
+
+    raise Exception(f"All proxy attempts + direct fallback failed. Last error: {last_err}")
 
 
 async def resolve_url(url: str) -> str:
@@ -503,5 +541,38 @@ async def fallback_stats():
     rate = (FALLBACK_STATS["fallback_fired"] / total * 100) if total else 0
     return Response(
         content=json.dumps({**FALLBACK_STATS, "total_requests": total, "fallback_rate_pct": round(rate, 2)}),
+        status_code=200, media_type="application/json"
+    )
+
+
+@app.get("/api/external/admin/reload-proxies")
+async def reload_proxies_endpoint():
+    """Hot-reload proxies.txt without restarting the Space."""
+    old_count = len(PROXIES)
+    load_proxies()
+    PROXY_FAILURES.clear()
+    return Response(
+        content=json.dumps({
+            "status": "ok",
+            "old_proxy_count": old_count,
+            "new_proxy_count": len(PROXIES),
+            "message": "Proxies reloaded and failure counters reset."
+        }),
+        status_code=200, media_type="application/json"
+    )
+
+
+@app.get("/health")
+async def health():
+    """Quick health check — confirms the API is up and reports proxy pool size."""
+    healthy = [p for p in PROXIES if PROXY_FAILURES.get(p, 0) < MAX_PROXY_FAILURES]
+    return Response(
+        content=json.dumps({
+            "status": "ok",
+            "proxy_total": len(PROXIES),
+            "proxy_healthy": len(healthy),
+            "proxy_failures": {k: v for k, v in PROXY_FAILURES.items() if v > 0},
+            "fallback_stats": FALLBACK_STATS,
+        }),
         status_code=200, media_type="application/json"
     )
