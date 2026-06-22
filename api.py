@@ -1022,6 +1022,7 @@ async def health():
         content=json.dumps({
             "status": "ok",
             "proxy_enabled": _PROXY_ENABLED,
+            "session_cookie_set": bool(os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")),
             "proxy_total": len(PROXIES),
             "proxy_healthy": len(healthy),
             "proxy_failures": {k: v for k, v in PROXY_FAILURES.items() if v > 0},
