@@ -359,6 +359,7 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
                     last_err = f"Proxy error: {type(e).__name__}: {e}"
+                    print(f"[PROXY DEBUG] Bulk proxy fetch failed: {last_err}")
 
             if all_timed_out:
                 _record_proxy_all_timeout()
