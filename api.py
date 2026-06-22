@@ -34,14 +34,14 @@ if not _PROXY_ENABLED:
 #    called by the automated liveness / hold-end checker.  These are
 #    NEVER starved, even during a heavy Inspector bulk run.
 #
-#  _BULK_SEMAPHORE (8 slots):
+#  _BULK_SEMAPHORE (3 slots):
 #    Used by /api/external/bulk/check — the batch endpoint called by the
 #    Reddit Inspector.  8 parallel fetches inside a single batch request
 #    means 500 URLs ≈ 25 HTTP round-trips instead of 500, making the
 #    Inspector fast while keeping the priority lane clear.
 # -----------------------------------------------------------------------
 _PRIORITY_SEMAPHORE = asyncio.Semaphore(3)
-_BULK_SEMAPHORE     = asyncio.Semaphore(8)
+_BULK_SEMAPHORE     = asyncio.Semaphore(3)
 
 # -----------------------------------------------------------------------
 # Proxy circuit breaker
@@ -259,8 +259,9 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
 
 async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
     """
-    Same as stealth_fetch but uses _BULK_SEMAPHORE (8 slots) and a reduced
-    retry budget for speed.  Used exclusively by the /bulk/check endpoint.
+    Same as stealth_fetch but uses _BULK_SEMAPHORE (3 slots, to avoid Reddit
+    rate-limiting) and a reduced retry budget for speed.  Used exclusively by
+    the /bulk/check endpoint.
     """
     async with _BULK_SEMAPHORE:
         MAX_RETRIES = 2     # Speed > thoroughness in bulk mode
@@ -327,19 +328,30 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
             if _is_circuit_open():
                 pass  # already logged in stealth_fetch; keep logs clean
 
-        # Direct fallback
-        try:
-            async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
-                resp = await session.request(
-                    method=method, url=url, headers=headers,
-                    allow_redirects=allow_redirects, timeout=10.0,
-                )
-            body_lower = resp.text[:2000].lower() if resp.text else ""
-            if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
-                return resp
-            last_err = f"Direct also blocked (HTTP {resp.status_code})"
-        except Exception as e:
-            last_err = f"Direct error: {type(e).__name__}: {e}"
+        # Direct fallback — with 429 retry so Reddit rate-limits don't
+        # permanently error every URL in the batch.
+        for direct_attempt in range(3):
+            try:
+                async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
+                    resp = await session.request(
+                        method=method, url=url, headers=headers,
+                        allow_redirects=allow_redirects, timeout=10.0,
+                    )
+                body_lower = resp.text[:2000].lower() if resp.text else ""
+                if resp.status_code == 429:
+                    # Rate-limited — back off and retry
+                    wait = 2.0 * (direct_attempt + 1) + random.uniform(0, 1.0)
+                    print(f"[BULK] 429 rate-limit on direct fetch, waiting {wait:.1f}s before retry")
+                    await asyncio.sleep(wait)
+                    last_err = "Direct rate-limited (HTTP 429)"
+                    continue
+                if resp.status_code not in (403, 503, 520, 521, 522) and "just a moment" not in body_lower:
+                    return resp
+                last_err = f"Direct also blocked (HTTP {resp.status_code})"
+                break  # non-429 block — don't retry
+            except Exception as e:
+                last_err = f"Direct error: {type(e).__name__}: {e}"
+                break
 
         raise Exception(f"Bulk fetch failed. Last error: {last_err}")
 
