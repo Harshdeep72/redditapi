@@ -20,14 +20,21 @@ MAX_PROXY_FAILURES = 4  # Raised so a noisy proxy doesn't exhaust the pool too f
 FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "total_miss": 0}
 
 # -----------------------------------------------------------------------
-# Concurrency limiter: max 4 simultaneous stealth_fetch calls across ALL
-# endpoints.  Without this, a Reddit Inspector bulk run (concurrency=5,
-# 500 URLs) saturates the single-process FastAPI worker, causing the
-# automated hold-end liveness checks from the bot to time out and return
-# "inconclusive".  The semaphore ensures liveness checks always get
-# a slot even while the inspector is running.
+# Two-tier concurrency control:
+#
+#  _PRIORITY_SEMAPHORE (3 slots):
+#    Used by /check/comment, /check/post, /proxy/json — the endpoints
+#    called by the automated liveness / hold-end checker.  These are
+#    NEVER starved, even during a heavy Inspector bulk run.
+#
+#  _BULK_SEMAPHORE (8 slots):
+#    Used by /api/external/bulk/check — the batch endpoint called by the
+#    Reddit Inspector.  8 parallel fetches inside a single batch request
+#    means 500 URLs ≈ 25 HTTP round-trips instead of 500, making the
+#    Inspector fast while keeping the priority lane clear.
 # -----------------------------------------------------------------------
-_FETCH_SEMAPHORE = asyncio.Semaphore(4)
+_PRIORITY_SEMAPHORE = asyncio.Semaphore(3)
+_BULK_SEMAPHORE     = asyncio.Semaphore(8)
 
 def load_proxies():
     global PROXIES
@@ -77,10 +84,10 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
       - Only fall back to a direct attempt as a last resort (useful for non-Reddit
         URLs that don't block HF IPs, e.g. redd.it share-link resolution).
 
-    The global _FETCH_SEMAPHORE limits total concurrent calls to 4, preventing
-    bulk Inspector runs from starving the automated liveness checker.
+    The _PRIORITY_SEMAPHORE limits concurrent calls to 3 slots reserved
+    exclusively for liveness checks — they are NEVER blocked by the inspector.
     """
-    async with _FETCH_SEMAPHORE:
+    async with _PRIORITY_SEMAPHORE:
         MAX_RETRIES = 6  # More retries so rotating proxies have a real chance
         last_err = None
 
@@ -174,6 +181,320 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
             last_err = f"Direct error: {type(e).__name__}: {e}"
 
         raise Exception(f"All proxy attempts + direct fallback failed. Last error: {last_err}")
+
+
+async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
+    """
+    Same as stealth_fetch but uses _BULK_SEMAPHORE (8 slots) instead of
+    _PRIORITY_SEMAPHORE.  Used exclusively by the /bulk/check endpoint so
+    that Inspector runs never compete with liveness checks for semaphore slots.
+    """
+    async with _BULK_SEMAPHORE:
+        MAX_RETRIES = 4  # Fewer retries in bulk mode — speed > thoroughness
+        last_err = None
+
+        headers = {
+            "Accept": "application/json, text/html, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
+        if cookie:
+            headers["Cookie"] = f"reddit_session={cookie}"
+
+        for attempt in range(MAX_RETRIES):
+            if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
+                PROXY_FAILURES.clear()
+
+            proxy = get_healthy_proxy()
+            proxies_config = {"http": proxy, "https": proxy} if proxy else None
+
+            if attempt > 0:
+                sleep_s = min(0.3 * (2 ** (attempt - 1)), 3.0) + random.uniform(0, 0.3)
+                await asyncio.sleep(sleep_s)
+
+            try:
+                async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config) as session:
+                    resp = await session.request(
+                        method=method, url=url, headers=headers,
+                        allow_redirects=allow_redirects, timeout=8.0,
+                    )
+                body_lower = resp.text.lower() if resp.text else ""
+                is_blocked = (
+                    resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
+                    or "challenge platform" in body_lower
+                    or "just a moment" in body_lower
+                )
+                if is_blocked:
+                    if proxy:
+                        PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+                    last_err = f"Blocked (HTTP {resp.status_code})"
+                    continue
+                if proxy:
+                    PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+                return resp
+            except Exception as e:
+                if proxy:
+                    PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+                last_err = f"Proxy error: {type(e).__name__}: {e}"
+
+        raise Exception(f"Bulk fetch failed. Last error: {last_err}")
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by the bulk endpoint
+# ---------------------------------------------------------------------------
+
+def _detect_url_type(url: str) -> str:
+    """Return 'comment' or 'post' based on URL shape."""
+    clean = url.split("?")[0].rstrip("/")
+    if "/comment/" in clean:
+        return "comment"
+    if "/comments/" not in clean:
+        return "post"
+    after = clean.split("/comments/")[1]
+    segs = [s for s in after.split("/") if s]
+    # segs: [postId, title?, commentId?]
+    if len(segs) >= 3 and re.match(r'^[a-z0-9]{4,}$', segs[2], re.I):
+        return "comment"
+    return "post"
+
+
+async def _bulk_check_single(url: str) -> dict:
+    """Check one URL (comment or post) and return a flat result dict."""
+    start = time.time()
+    try:
+        # Resolve share links
+        resolved = url
+        if "redd.it" in url or "/s/" in url:
+            try:
+                r = await bulk_stealth_fetch(url, method="HEAD", allow_redirects=True)
+                if r.url and str(r.url) != url:
+                    resolved = str(r.url)
+            except Exception:
+                pass
+
+        # Strip query string + trailing slash
+        clean = resolved.split("?")[0].rstrip("/")
+        url_type = _detect_url_type(clean)
+
+        if url_type == "comment":
+            match = re.search(r'/comments/([^/]+)/[^/]+/([^/]+)', clean)
+            if not match:
+                return {"url": url, "type": "comment", "error": "Cannot parse comment URL", "data": None}
+            post_id, comment_id = match.groups()
+            sub_match = re.search(r'/r/([^/]+)', clean)
+            subreddit = sub_match.group(1) if sub_match else "all"
+
+            fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=0&limit=1"
+            try:
+                resp = await bulk_stealth_fetch(fetch_url)
+            except Exception as e:
+                return {"url": url, "type": "comment", "error": str(e), "data": None}
+
+            if resp.status_code == 404:
+                return {"url": url, "type": "comment", "error": None, "data": {
+                    "status": "not_found", "author": None, "subreddit": subreddit,
+                    "body_preview": None, "score": 0, "created_utc": None, "post_status": "deleted"
+                }}
+
+            try:
+                data = resp.json()
+            except Exception:
+                return {"url": url, "type": "comment", "error": "Invalid JSON from Reddit", "data": None}
+
+            post_data = data[0]["data"]["children"][0]["data"]
+            post_status = "deleted" if post_data.get("author") == "[deleted]" else (
+                "removed" if post_data.get("removed_by_category") else "active"
+            )
+            comment_data = walk_comment_tree(data[1]["data"]["children"], comment_id)
+
+            if not comment_data:
+                # Fallback: wide fetch
+                try:
+                    r2 = await bulk_stealth_fetch(
+                        f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1"
+                    )
+                    if r2.status_code == 200:
+                        d2 = r2.json()
+                        comment_data = walk_comment_tree(d2[1]["data"]["children"], comment_id)
+                except Exception:
+                    pass
+
+            if not comment_data:
+                return {"url": url, "type": "comment", "error": None, "data": {
+                    "status": "not_found", "author": None, "subreddit": subreddit,
+                    "body_preview": None, "score": 0, "created_utc": None, "post_status": post_status
+                }}
+
+            body = comment_data.get("body", "")
+            author = comment_data.get("author")
+            status = "live"
+            if body == "[removed]":
+                status = "removed"
+            elif body == "[deleted]" and author == "[deleted]":
+                status = "deleted"
+
+            elapsed = int((time.time() - start) * 1000)
+            print(f"[BULK:COMMENT] {comment_id} -> {status} ({elapsed}ms)")
+            return {"url": url, "type": "comment", "error": None, "data": {
+                "status": status, "liveness": status,
+                "author": author, "subreddit": comment_data.get("subreddit") or subreddit,
+                "body_preview": body[:100] if body else None,
+                "score": comment_data.get("score", 0),
+                "upvotes": comment_data.get("score", 0),
+                "depth": comment_data.get("depth", 0),
+                "created_utc": comment_data.get("created_utc"),
+                "createdAt": comment_data.get("created_utc"),
+                "post_status": post_status, "error": None
+            }}
+
+        else:  # post
+            match = re.search(r'/comments/([^/]+)', clean)
+            if not match:
+                return {"url": url, "type": "post", "error": "Cannot parse post URL", "data": None}
+            post_id = match.group(1)
+            sub_match = re.search(r'/r/([^/]+)', clean)
+            subreddit = sub_match.group(1) if sub_match else "all"
+
+            fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=1&raw_json=1"
+            try:
+                resp = await bulk_stealth_fetch(fetch_url)
+            except Exception as e:
+                return {"url": url, "type": "post", "error": str(e), "data": None}
+
+            if resp.status_code == 404:
+                return {"url": url, "type": "post", "error": None, "data": {
+                    "status": "not_found", "author": None, "subreddit": subreddit,
+                    "title": None, "score": 0, "created_utc": None
+                }}
+
+            try:
+                data = resp.json()
+                post_data = data[0]["data"]["children"][0]["data"]
+            except Exception:
+                return {"url": url, "type": "post", "error": "Invalid JSON from Reddit", "data": None}
+
+            removed_by = post_data.get("removed_by_category")
+            author = post_data.get("author")
+            selftext = post_data.get("selftext", "")
+            status = "active"
+            if removed_by == "spam":
+                status = "spam"
+            elif removed_by:
+                status = "removed"
+            elif selftext == "[removed]":
+                status = "removed"
+            elif author == "[deleted]":
+                status = "deleted"
+
+            elapsed = int((time.time() - start) * 1000)
+            print(f"[BULK:POST] {post_id} -> {status} ({elapsed}ms)")
+            return {"url": url, "type": "post", "error": None, "data": {
+                "status": status, "liveness": "live" if status == "active" else status,
+                "author": author, "subreddit": post_data.get("subreddit") or subreddit,
+                "title": post_data.get("title"),
+                "score": post_data.get("score", 0),
+                "upvotes": post_data.get("score", 0),
+                "num_comments": post_data.get("num_comments", 0),
+                "removed_by_category": removed_by,
+                "created_utc": post_data.get("created_utc"),
+                "createdAt": post_data.get("created_utc"),
+                "error": None
+            }}
+
+    except Exception as e:
+        return {"url": url, "type": "unknown", "error": str(e), "data": None}
+
+
+async def _bulk_check_account(username: str) -> dict:
+    """Check one Reddit account. Returns dict with account data."""
+    try:
+        fetch_url = f"https://old.reddit.com/user/{username}/about.json?raw_json=1"
+        resp = await bulk_stealth_fetch(fetch_url)
+        if resp.status_code == 200:
+            data = resp.json().get("data", {})
+            return {
+                "username": data.get("name", username),
+                "status": "suspended" if data.get("is_suspended") else "active",
+                "total_karma": data.get("total_karma", 0),
+                "created_utc": data.get("created_utc"),
+                "avatar_url": data.get("icon_img"),
+                "last_active_utc": None,
+                "error": None
+            }
+        elif resp.status_code == 404:
+            # Could be deleted or shadowbanned — check HTML
+            try:
+                html_resp = await bulk_stealth_fetch(f"https://old.reddit.com/user/{username}/")
+                status = "shadowbanned" if html_resp.status_code == 200 else "deleted"
+            except Exception:
+                status = "deleted"
+            return {"username": username, "status": status, "total_karma": 0,
+                    "created_utc": None, "avatar_url": None, "last_active_utc": None, "error": None}
+        else:
+            return {"username": username, "status": "error", "total_karma": 0,
+                    "created_utc": None, "avatar_url": None, "last_active_utc": None,
+                    "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"username": username, "status": "error", "total_karma": 0,
+                "created_utc": None, "avatar_url": None, "last_active_utc": None, "error": str(e)}
+
+
+@app.post("/api/external/bulk/check")
+async def bulk_check(request: Request):
+    """
+    Batch endpoint for the Reddit Inspector.
+
+    Accepts: {"urls": ["...", ...], "include_author": true}
+    Returns: {"results": [{url, type, data, author, error}, ...]}
+
+    Processes up to 20 URLs concurrently inside this one request using
+    _BULK_SEMAPHORE, keeping the priority lane (_PRIORITY_SEMAPHORE) clear
+    for the automated liveness / hold-end checker.
+    """
+    body = await request.json()
+    raw_urls: list = body.get("urls", [])
+    include_author: bool = body.get("include_author", True)
+    urls = [u.strip() for u in raw_urls if isinstance(u, str) and u.strip()][:50]  # max 50 per call
+
+    if not urls:
+        return Response(content=json.dumps({"error": "No URLs provided"}), status_code=400, media_type="application/json")
+
+    # Run all URL checks concurrently
+    url_tasks = [_bulk_check_single(u) for u in urls]
+    url_results = await asyncio.gather(*url_tasks, return_exceptions=False)
+
+    # Batch-fetch unique authors concurrently (with caching)
+    results = list(url_results)
+    if include_author:
+        authors_needed = list({
+            r["data"]["author"]
+            for r in results
+            if r.get("data") and r["data"].get("author")
+            and r["data"]["author"] not in ("[deleted]", None)
+        })
+
+        author_tasks = [_bulk_check_account(a) for a in authors_needed]
+        author_data_list = await asyncio.gather(*author_tasks, return_exceptions=False)
+        author_map = {d["username"]: d for d in author_data_list if d.get("username")}
+
+        for r in results:
+            author = r.get("data", {}) and r["data"].get("author")
+            if not author:
+                r["author"] = None
+            elif author == "[deleted]":
+                r["author"] = {"username": "[deleted]", "status": "deleted",
+                               "total_karma": 0, "created_utc": None, "avatar_url": None,
+                               "last_active_utc": None, "error": None}
+            else:
+                r["author"] = author_map.get(author)
+    else:
+        for r in results:
+            r["author"] = None
+
+    return Response(content=json.dumps({"results": results}), status_code=200, media_type="application/json")
 
 async def resolve_url(url: str) -> str:
     """Resolve shortlinks and normalize reddit URLs."""
