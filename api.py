@@ -76,7 +76,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                 url=url,
                 headers=headers,
                 allow_redirects=allow_redirects,
-                timeout=15.0
+                timeout=5.0
             )
             
             # If not blocked, return immediately
@@ -100,7 +100,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     url=url,
                     headers=headers,
                     allow_redirects=allow_redirects,
-                    timeout=15.0
+                    timeout=6.0
                 )
                 
                 # Check for Cloudflare / block signals
