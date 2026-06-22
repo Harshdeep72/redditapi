@@ -62,7 +62,6 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         "Accept": "application/json, text/html",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, br",
-        "Connection": "close",
     }
     
     cookie = os.environ.get("REDDIT_SESSION_COOKIE")
