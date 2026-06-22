@@ -96,13 +96,19 @@ def _record_proxy_success() -> None:
 
 
 def _parse_proxy_lines(lines: list) -> list:
-    """Parse raw proxy strings into normalised http://user:pw@host:port URLs."""
+    """Parse raw proxy strings into normalised URLs."""
     formatted = []
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        line = line.replace("http://", "").replace("https://", "").replace("socks5://", "")
+        
+        # If the user provides a full URL with scheme, keep it
+        if line.startswith("http://") or line.startswith("https://") or line.startswith("socks5://") or line.startswith("socks5h://"):
+            formatted.append(line)
+            continue
+            
+        # Otherwise, assume http:// and format
         if "@" in line:
             formatted.append(f"http://{line}")
             continue
