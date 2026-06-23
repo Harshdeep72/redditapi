@@ -34,15 +34,57 @@ if not _PROXY_ENABLED:
 #    called by the automated liveness / hold-end checker.  These are
 #    NEVER starved, even during a heavy Inspector bulk run.
 #
-#  _BULK_SEMAPHORE (20 slots):
-#    Used by /api/external/bulk/check — the batch endpoint called by the
-#    Reddit Inspector.  8 parallel fetches inside a single batch request
-#    means 500 URLs ≈ 25 HTTP round-trips instead of 500, making the
-#    Inspector fast while keeping the priority lane clear.
-#    Massive concurrency for DataImpulse residential proxies (rotates per connection).
+#  _BULK_SEMAPHORE (3 slots):
+#    Slow & Steady bulk fetches to mimic human browsing behavior.
+#    Limits concurrency to 3 slots for bulk requests.
 # -----------------------------------------------------------------------
 _PRIORITY_SEMAPHORE = asyncio.Semaphore(3)
-_BULK_SEMAPHORE     = asyncio.Semaphore(20)
+_BULK_SEMAPHORE     = asyncio.Semaphore(3)
+_AUTHOR_SEMAPHORE   = asyncio.Semaphore(2)
+
+IS_SINGLE_ROTATING_GATEWAY = False
+PROXY_INDEX = 0
+
+# In-memory caches (Key -> (Value, ExpiryTime))
+SHORTLINK_CACHE: Dict[str, Any] = {}
+POST_CACHE: Dict[str, Any] = {}
+COMMENT_CACHE: Dict[str, Any] = {}
+AUTHOR_CACHE: Dict[str, Any] = {}
+
+def get_from_cache(cache: dict, key: str) -> Optional[Any]:
+    if key in cache:
+        val, expiry = cache[key]
+        if time.time() < expiry:
+            return val
+        else:
+            del cache[key]
+    return None
+
+def set_in_cache(cache: dict, key: str, value: Any, ttl: float = 3600.0):
+    cache[key] = (value, time.time() + ttl)
+
+class StealthResponse:
+    def __init__(self, status_code: int, text: str, headers: Dict[str, str], url: str):
+        self.status_code = status_code
+        self.text = text
+        self.headers = headers
+        self.url = url
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+async def read_stream_limit(resp, limit_bytes: int = 8192) -> bytes:
+    chunks = []
+    bytes_read = 0
+    try:
+        async for chunk in resp.aiter_content(chunk_size=1024):
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+            if bytes_read >= limit_bytes:
+                break
+    finally:
+        await resp.aclose()
+    return b"".join(chunks)
 
 # -----------------------------------------------------------------------
 # Proxy circuit breaker
@@ -124,7 +166,7 @@ def _parse_proxy_lines(lines: list) -> list:
 
 def load_proxies():
     """Load proxies from proxies.txt and/or PROXY_LIST_URL env var (one proxy per line)."""
-    global PROXIES
+    global PROXIES, IS_SINGLE_ROTATING_GATEWAY
     lines = []
 
     # Source 1: local proxies.txt
@@ -148,23 +190,40 @@ def load_proxies():
     proxy_string = os.environ.get("PROXY_STRING", "").strip()
     if proxy_string:
         lines.append(proxy_string)
-        print("[PROXY] Loaded single rotating gateway from PROXY_STRING.")
+        if "gateway.dataimpulse.com" in proxy_string or "dataimpulse.com:823" in proxy_string or "gw.dataimpulse.com" in proxy_string:
+            IS_SINGLE_ROTATING_GATEWAY = True
+            print("[PROXY] Detected single rotating gateway (DataImpulse) in PROXY_STRING. Rotation disabled.")
+        else:
+            print("[PROXY] Loaded single rotating gateway from PROXY_STRING.")
 
     PROXIES = _parse_proxy_lines(lines)
-    print(f"Loaded {len(PROXIES)} proxies total.")
+    
+    # Enable single gateway mode if we only have 1 proxy or if any proxy is DataImpulse
+    if len(PROXIES) == 1 or any("dataimpulse" in p or ":823" in p for p in PROXIES):
+        IS_SINGLE_ROTATING_GATEWAY = True
+
+    if not IS_SINGLE_ROTATING_GATEWAY and len(PROXIES) > 1:
+        random.shuffle(PROXIES)
+    print(f"Loaded {len(PROXIES)} proxies total. IS_SINGLE_ROTATING_GATEWAY={IS_SINGLE_ROTATING_GATEWAY}")
 
 load_proxies()
 
 
 def get_healthy_proxy() -> Optional[str]:
+    global PROXY_INDEX
     if not PROXIES:
         return None
+    if IS_SINGLE_ROTATING_GATEWAY:
+        # Always use the gateway, DataImpulse handles rotation internally per connection
+        return PROXIES[-1]
     healthy = [p for p in PROXIES if PROXY_FAILURES.get(p, 0) < MAX_PROXY_FAILURES]
     if not healthy:
         # If all fail, reset failures and try again
         PROXY_FAILURES.clear()
         healthy = PROXIES
-    return random.choice(healthy)
+    proxy = healthy[PROXY_INDEX % len(healthy)]
+    PROXY_INDEX += 1
+    return proxy
 
 async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
     """
@@ -295,106 +354,89 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
         raise Exception(f"All fetch attempts failed. Last error: {last_err}")
 
 
-async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
+async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> StealthResponse:
     """
-    Same as stealth_fetch but uses _BULK_SEMAPHORE (3 slots, to avoid Reddit
-    rate-limiting) and a reduced retry budget for speed.  Used exclusively by
-    the /bulk/check endpoint.
+    Slow & Steady bulk fetch with residential proxy, strict rate limit backing-off,
+    bandwidth optimization (HEAD / streaming first 8KB), and no direct fallback.
     """
     async with _BULK_SEMAPHORE:
-        MAX_RETRIES = 2     # Speed > thoroughness in bulk mode
-        PROXY_TIMEOUT = 12.0 # Residential proxies are slow
-        last_err = None
+        if _is_circuit_open():
+            raise Exception("Proxy circuit breaker is open: proxy unavailable")
 
         headers = {
             "Accept": "application/json, text/html, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Cookie": "over18=1",
         }
-        # Do NOT use REDDIT_SESSION for bulk checks!
-        # Sending the same session cookie from 50 different IP addresses simultaneously
-        # triggers Reddit's anti-bot system and rate-limits the account.
-        # Instead, we just inject a generic over18=1 cookie to bypass NSFW gates.
-        headers["Cookie"] = "over18=1"
 
-        all_timed_out = True
+        proxy = get_healthy_proxy()
+        proxies_config = {"http": proxy, "https": proxy} if proxy else None
 
-        if _PROXY_ENABLED and PROXIES and not _is_circuit_open():
-            for attempt in range(MAX_RETRIES):
-                if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
-                    PROXY_FAILURES.clear()
-
-                proxy = get_healthy_proxy()
-                proxies_config = {"http": proxy, "https": proxy} if proxy else None
-
-                if attempt > 0 and len(PROXIES) > 1:
-                    sleep_s = min(0.2 * (2 ** (attempt - 1)), 1.0) + random.uniform(0, 0.2)
-                    await asyncio.sleep(sleep_s)
-
-                try:
-                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as session:
-                        resp = await session.request(
-                            method=method, url=url, headers=headers,
-                            allow_redirects=allow_redirects, timeout=PROXY_TIMEOUT,
-                        )
-                    body_lower = resp.text[:2000].lower() if resp.text else ""
-                    is_blocked = (
-                        resp.status_code in (403, 429, 503, 520, 521, 522, 523, 524)
-                        or "challenge platform" in body_lower
-                        or "just a moment" in body_lower
-                    )
-                    if is_blocked:
-                        if proxy:
-                            PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                        last_err = f"Blocked (HTTP {resp.status_code})"
-                        all_timed_out = False
-                        continue
-                    if proxy:
-                        PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
-                    _record_proxy_success()
-                    return resp
-                except Exception as e:
-                    err_str = str(e)
-                    if "timeout" not in err_str.lower() and "timed out" not in err_str.lower() and "28" not in err_str:
-                        all_timed_out = False
-                    if proxy:
-                        PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                    last_err = f"Proxy error: {type(e).__name__}: {e}"
-                    print(f"[PROXY DEBUG] Bulk proxy fetch failed: {last_err}")
-
-            if all_timed_out:
-                _record_proxy_all_timeout()
-        else:
-            if _is_circuit_open():
-                pass  # already logged in stealth_fetch; keep logs clean
-
-        # Direct fallback — with 429 retry so Reddit rate-limits don't
-        # permanently error every URL in the batch.
-        for direct_attempt in range(3):
-            try:
-                async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
-                    resp = await session.request(
-                        method=method, url=url, headers=headers,
-                        allow_redirects=allow_redirects, timeout=10.0,
-                    )
-                body_lower = resp.text[:2000].lower() if resp.text else ""
+        async def do_fetch() -> StealthResponse:
+            async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as session:
+                resp = await session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    allow_redirects=allow_redirects,
+                    timeout=20.0,
+                    stream=(method != "HEAD")
+                )
+                
                 if resp.status_code == 429:
-                    # Rate-limited — back off and retry
-                    wait = 2.0 * (direct_attempt + 1) + random.uniform(0, 1.0)
-                    print(f"[BULK] 429 rate-limit on direct fetch, waiting {wait:.1f}s before retry")
-                    await asyncio.sleep(wait)
-                    last_err = "Direct rate-limited (HTTP 429)"
-                    continue
-                if resp.status_code not in (403, 503, 520, 521, 522) and "just a moment" not in body_lower:
-                    return resp
-                last_err = f"Direct also blocked (HTTP {resp.status_code})"
-                break  # non-429 block — don't retry
-            except Exception as e:
-                last_err = f"Direct error: {type(e).__name__}: {e}"
-                break
+                    await resp.aclose()
+                    print(f"[BULK] 429 rate-limit on proxy fetch, waiting 60s before retry...")
+                    await asyncio.sleep(60.0)
+                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as retry_session:
+                        resp = await retry_session.request(
+                            method=method,
+                            url=url,
+                            headers=headers,
+                            allow_redirects=allow_redirects,
+                            timeout=20.0,
+                            stream=(method != "HEAD")
+                        )
+                
+                if resp.status_code == 429:
+                    await resp.aclose()
+                    raise Exception("Proxy rate-limited after retry (HTTP 429)")
 
-        raise Exception(f"Bulk fetch failed. Last error: {last_err}")
+                text_content = ""
+                body_lower = ""
+                if method != "HEAD":
+                    raw_body = await read_stream_limit(resp, limit_bytes=8192)
+                    text_content = raw_body.decode("utf-8", errors="ignore")
+                    body_lower = text_content[:2000].lower()
+                else:
+                    await resp.aclose()
+
+                is_blocked = (
+                    resp.status_code in (403, 503, 520, 521, 522, 523, 524)
+                    or "challenge platform" in body_lower
+                    or "just a moment" in body_lower
+                )
+                if is_blocked:
+                    raise Exception(f"Proxy blocked (HTTP {resp.status_code})")
+
+                return StealthResponse(resp.status_code, text_content, dict(resp.headers), str(resp.url))
+
+        try:
+            res = await do_fetch()
+            if proxy and not IS_SINGLE_ROTATING_GATEWAY:
+                PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+            _record_proxy_success()
+            return res
+        except Exception as e:
+            err_str = str(e)
+            is_timeout = "timeout" in err_str.lower() or "timed out" in err_str.lower() or "28" in err_str
+            if is_timeout:
+                _record_proxy_all_timeout()
+            if proxy and not IS_SINGLE_ROTATING_GATEWAY:
+                PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+            print(f"[PROXY DEBUG] Bulk proxy fetch failed: {err_str}")
+            raise Exception(f"Bulk fetch failed. Last error: {err_str}")
 
 
 
@@ -419,22 +461,34 @@ def _detect_url_type(url: str) -> str:
 
 
 async def _bulk_check_single(url: str) -> dict:
-    """Check one URL (comment or post) and return a flat result dict."""
+    """Check one URL (comment or post) and return a flat result dict with bandwidth & cache optimization."""
     start = time.time()
     try:
-        # Resolve share links
-        resolved = url
-        if "redd.it" in url or "/s/" in url:
-            try:
-                r = await bulk_stealth_fetch(url, method="HEAD", allow_redirects=True)
-                if r.url and str(r.url) != url:
-                    resolved = str(r.url)
-            except Exception:
-                pass
+        # Resolve share links using HEAD only and caching
+        resolved = get_from_cache(SHORTLINK_CACHE, url)
+        if not resolved:
+            resolved = url
+            if "redd.it" in url or "/s/" in url:
+                try:
+                    r = await bulk_stealth_fetch(url, method="HEAD", allow_redirects=True)
+                    if r.url and str(r.url) != url:
+                        resolved = str(r.url)
+                        set_in_cache(SHORTLINK_CACHE, url, resolved)
+                except Exception:
+                    pass
 
         # Strip query string + trailing slash
         clean = resolved.split("?")[0].rstrip("/")
         url_type = _detect_url_type(clean)
+
+        # Check in-memory cache
+        cached_res = get_from_cache(COMMENT_CACHE if url_type == "comment" else POST_CACHE, clean)
+        if cached_res:
+            elapsed = int((time.time() - start) * 1000)
+            print(f"[BULK:CACHE_HIT] {clean} ({elapsed}ms)")
+            res_copy = dict(cached_res)
+            res_copy["url"] = url
+            return res_copy
 
         if url_type == "comment":
             match = re.search(r'/comments/([^/]+)/[^/]+/([^/]+)', clean)
@@ -444,17 +498,34 @@ async def _bulk_check_single(url: str) -> dict:
             sub_match = re.search(r'/r/([^/]+)', clean)
             subreddit = sub_match.group(1) if sub_match else "all"
 
-            fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=0&limit=1"
+            # 1. HEAD request check
+            head_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}/"
+            try:
+                h_resp = await bulk_stealth_fetch(head_url, method="HEAD")
+                if h_resp.status_code == 404:
+                    res = {"url": url, "type": "comment", "error": None, "data": {
+                        "status": "not_found", "author": None, "subreddit": subreddit,
+                        "body_preview": None, "score": 0, "created_utc": None, "post_status": "deleted"
+                    }}
+                    set_in_cache(COMMENT_CACHE, clean, res)
+                    return res
+            except Exception as e:
+                return {"url": url, "type": "comment", "error": f"HEAD failed: {str(e)}", "data": None}
+
+            # 2. Narrow GET request with limit=0&context=0
+            fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=0&limit=0"
             try:
                 resp = await bulk_stealth_fetch(fetch_url)
             except Exception as e:
                 return {"url": url, "type": "comment", "error": str(e), "data": None}
 
             if resp.status_code == 404:
-                return {"url": url, "type": "comment", "error": None, "data": {
+                res = {"url": url, "type": "comment", "error": None, "data": {
                     "status": "not_found", "author": None, "subreddit": subreddit,
                     "body_preview": None, "score": 0, "created_utc": None, "post_status": "deleted"
                 }}
+                set_in_cache(COMMENT_CACHE, clean, res)
+                return res
 
             try:
                 data = resp.json()
@@ -468,22 +539,12 @@ async def _bulk_check_single(url: str) -> dict:
             comment_data = walk_comment_tree(data[1]["data"]["children"], comment_id)
 
             if not comment_data:
-                # Fallback: wide fetch
-                try:
-                    r2 = await bulk_stealth_fetch(
-                        f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1"
-                    )
-                    if r2.status_code == 200:
-                        d2 = r2.json()
-                        comment_data = walk_comment_tree(d2[1]["data"]["children"], comment_id)
-                except Exception:
-                    pass
-
-            if not comment_data:
-                return {"url": url, "type": "comment", "error": None, "data": {
+                res = {"url": url, "type": "comment", "error": None, "data": {
                     "status": "not_found", "author": None, "subreddit": subreddit,
                     "body_preview": None, "score": 0, "created_utc": None, "post_status": post_status
                 }}
+                set_in_cache(COMMENT_CACHE, clean, res)
+                return res
 
             body = comment_data.get("body", "")
             author = comment_data.get("author")
@@ -495,7 +556,7 @@ async def _bulk_check_single(url: str) -> dict:
 
             elapsed = int((time.time() - start) * 1000)
             print(f"[BULK:COMMENT] {comment_id} -> {status} ({elapsed}ms)")
-            return {"url": url, "type": "comment", "error": None, "data": {
+            res = {"url": url, "type": "comment", "error": None, "data": {
                 "status": status, "liveness": status,
                 "author": author, "subreddit": comment_data.get("subreddit") or subreddit,
                 "body_preview": body[:100] if body else None,
@@ -506,6 +567,8 @@ async def _bulk_check_single(url: str) -> dict:
                 "createdAt": comment_data.get("created_utc"),
                 "post_status": post_status, "error": None
             }}
+            set_in_cache(COMMENT_CACHE, clean, res)
+            return res
 
         else:  # post
             match = re.search(r'/comments/([^/]+)', clean)
@@ -515,17 +578,34 @@ async def _bulk_check_single(url: str) -> dict:
             sub_match = re.search(r'/r/([^/]+)', clean)
             subreddit = sub_match.group(1) if sub_match else "all"
 
-            fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=1&raw_json=1"
+            # 1. HEAD request check
+            head_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/"
+            try:
+                h_resp = await bulk_stealth_fetch(head_url, method="HEAD")
+                if h_resp.status_code == 404:
+                    res = {"url": url, "type": "post", "error": None, "data": {
+                        "status": "not_found", "author": None, "subreddit": subreddit,
+                        "title": None, "score": 0, "created_utc": None
+                    }}
+                    set_in_cache(POST_CACHE, clean, res)
+                    return res
+            except Exception as e:
+                return {"url": url, "type": "post", "error": f"HEAD failed: {str(e)}", "data": None}
+
+            # 2. Narrow GET request with limit=0
+            fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=0&raw_json=1"
             try:
                 resp = await bulk_stealth_fetch(fetch_url)
             except Exception as e:
                 return {"url": url, "type": "post", "error": str(e), "data": None}
 
             if resp.status_code == 404:
-                return {"url": url, "type": "post", "error": None, "data": {
+                res = {"url": url, "type": "post", "error": None, "data": {
                     "status": "not_found", "author": None, "subreddit": subreddit,
                     "title": None, "score": 0, "created_utc": None
                 }}
+                set_in_cache(POST_CACHE, clean, res)
+                return res
 
             try:
                 data = resp.json()
@@ -548,7 +628,7 @@ async def _bulk_check_single(url: str) -> dict:
 
             elapsed = int((time.time() - start) * 1000)
             print(f"[BULK:POST] {post_id} -> {status} ({elapsed}ms)")
-            return {"url": url, "type": "post", "error": None, "data": {
+            res = {"url": url, "type": "post", "error": None, "data": {
                 "status": status, "liveness": "live" if status == "active" else status,
                 "author": author, "subreddit": post_data.get("subreddit") or subreddit,
                 "title": post_data.get("title"),
@@ -560,6 +640,8 @@ async def _bulk_check_single(url: str) -> dict:
                 "createdAt": post_data.get("created_utc"),
                 "error": None
             }}
+            set_in_cache(POST_CACHE, clean, res)
+            return res
 
     except Exception as e:
         return {"url": url, "type": "unknown", "error": str(e), "data": None}
@@ -607,35 +689,79 @@ async def bulk_check(request: Request):
     Accepts: {"urls": ["...", ...], "include_author": true}
     Returns: {"results": [{url, type, data, author, error}, ...]}
 
-    Processes up to 20 URLs concurrently inside this one request using
-    _BULK_SEMAPHORE, keeping the priority lane (_PRIORITY_SEMAPHORE) clear
-    for the automated liveness / hold-end checker.
+    Throttles checks: chunking (20 URLs/chunk), 10s delay between chunks,
+    caches resolved links and statuses, and rate-limits author fetches.
     """
     body = await request.json()
     raw_urls: list = body.get("urls", [])
     include_author: bool = body.get("include_author", True)
-    urls = [u.strip() for u in raw_urls if isinstance(u, str) and u.strip()][:50]  # max 50 per call
+    urls = [u.strip() for u in raw_urls if isinstance(u, str) and u.strip()][:245]  # Max 245 URLs
 
     if not urls:
         return Response(content=json.dumps({"error": "No URLs provided"}), status_code=400, media_type="application/json")
 
-    # Run all URL checks concurrently
-    url_tasks = [_bulk_check_single(u) for u in urls]
-    url_results = await asyncio.gather(*url_tasks, return_exceptions=False)
+    # Run checks sequentially in chunks of 20
+    chunk_size = 20
+    results = []
+    for i in range(0, len(urls), chunk_size):
+        chunk = urls[i:i+chunk_size]
+        url_tasks = [_bulk_check_single(u) for u in chunk]
+        chunk_results = await asyncio.gather(*url_tasks, return_exceptions=False)
+        results.extend(chunk_results)
+        
+        if i + chunk_size < len(urls):
+            print(f"[BULK] Chunk {i//chunk_size + 1} processed. Cool down for 10s...")
+            await asyncio.sleep(10.0)
 
-    # Batch-fetch unique authors concurrently (with caching)
-    results = list(url_results)
+    # Throttled & Cached Author Fetching
     if include_author:
-        authors_needed = list({
+        from collections import Counter
+        author_counts = Counter(
             r["data"]["author"]
             for r in results
             if r.get("data") and r["data"].get("author")
             and r["data"]["author"] not in ("[deleted]", None)
-        })
+        )
 
-        author_tasks = [_bulk_check_account(a) for a in authors_needed]
-        author_data_list = await asyncio.gather(*author_tasks, return_exceptions=False)
-        author_map = {d["username"]: d for d in author_data_list if d.get("username")}
+        author_map = {}
+        authors_to_query = []
+
+        for author, count in author_counts.items():
+            cached_author = get_from_cache(AUTHOR_CACHE, author)
+            if cached_author:
+                author_map[author] = cached_author
+            elif count > 3:
+                authors_to_query.append(author)
+            else:
+                # Skip fetch for low-frequency author, use placeholder
+                placeholder = {
+                    "username": author,
+                    "status": "active",
+                    "total_karma": 0,
+                    "created_utc": None,
+                    "avatar_url": None,
+                    "last_active_utc": None,
+                    "error": "Skipped fetch (low frequency)"
+                }
+                author_map[author] = placeholder
+
+        # Fetch remaining authors in batches of 5 with 2s delay and a concurrency of 2
+        async def check_author_with_semaphore(a: str) -> dict:
+            async with _AUTHOR_SEMAPHORE:
+                res = await _bulk_check_account(a)
+                if res.get("status") != "error":
+                    set_in_cache(AUTHOR_CACHE, a, res)
+                return res
+
+        for j in range(0, len(authors_to_query), 5):
+            batch = authors_to_query[j:j+5]
+            tasks = [check_author_with_semaphore(a) for a in batch]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=False)
+            for d in batch_results:
+                if d.get("username"):
+                    author_map[d["username"]] = d
+            if j + 5 < len(authors_to_query):
+                await asyncio.sleep(2.0)
 
         for r in results:
             author = r.get("data", {}) and r["data"].get("author")
