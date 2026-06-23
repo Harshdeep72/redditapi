@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import Any
@@ -84,39 +85,65 @@ class RedditSession:
 
     async def _ensure_session(self) -> None:
         """Create the curl_cffi session if not yet created."""
-        if self.proxy_list_url and not self._proxies_fetched:
-            try:
-                import aiohttp
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with aiohttp.ClientSession() as s:
-                    async with s.get(self.proxy_list_url, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            lines = text.splitlines()
-                            self.proxy_list = [line.strip() for line in lines if line.strip()]
-                            logger.info("Successfully loaded %d proxies from Webshare URL", len(self.proxy_list))
-                self._proxies_fetched = True
-            except Exception as e:
-                logger.error("Failed to fetch proxy list from URL: %s", e)
-                self._proxies_fetched = True
+        if not self._proxies_fetched:
+            # 1. Fetch remote list if proxy_list_url is provided
+            if self.proxy_list_url:
+                try:
+                    import aiohttp
+                    timeout = aiohttp.ClientTimeout(total=10)
+                    async with aiohttp.ClientSession() as s:
+                        async with s.get(self.proxy_list_url, timeout=timeout) as resp:
+                            if resp.status == 200:
+                                text = await resp.text()
+                                lines = text.splitlines()
+                                self.proxy_list.extend([line.strip() for line in lines if line.strip()])
+                                logger.info("Successfully loaded %d proxies from Webshare URL", len(self.proxy_list))
+                except Exception as e:
+                    logger.error("Failed to fetch proxy list from URL: %s", e)
+
+            # 2. Check local proxies.txt
+            if os.path.exists("proxies.txt"):
+                try:
+                    with open("proxies.txt", "r", encoding="utf-8") as f:
+                        for line in f:
+                            stripped = line.strip()
+                            if stripped and not stripped.startswith("#"):
+                                self.proxy_list.append(stripped)
+                    logger.info("Successfully loaded %d proxies from proxies.txt", len(self.proxy_list))
+                except Exception as e:
+                    logger.error("Failed to read proxies.txt: %s", e)
+
+            # 3. Check PROXY_STRING environment variable
+            env_proxy = os.environ.get("PROXY_STRING") or os.environ.get("PROXY_URL")
+            if env_proxy:
+                self.proxy_list.append(env_proxy.strip())
+                logger.info("Loaded proxy from PROXY_STRING environment variable")
+
+            # Remove duplicates while preserving order
+            seen = set()
+            self.proxy_list = [x for x in self.proxy_list if not (x in seen or seen.add(x))]
+            self._proxies_fetched = True
 
         if self._session is None:
             proxies = None
             if self.proxy_list:
                 proxy = random.choice(self.proxy_list)
-                parts = proxy.split(":")
-                if len(parts) == 4:
-                    ip, port, user, pwd = parts
-                    proxy_formatted = f"http://{user}:{pwd}@{ip}:{port}"
-                elif len(parts) == 2:
-                    ip, port = parts
-                    proxy_formatted = f"http://{ip}:{port}"
+                if "dataimpulse" in proxy.lower():
+                    proxy_formatted = proxy
                 else:
-                    proxy_formatted = f"http://{proxy}"
+                    parts = proxy.split(":")
+                    if len(parts) == 4:
+                        ip, port, user, pwd = parts
+                        proxy_formatted = f"http://{user}:{pwd}@{ip}:{port}"
+                    elif len(parts) == 2:
+                        ip, port = parts
+                        proxy_formatted = f"http://{ip}:{port}"
+                    else:
+                        proxy_formatted = f"http://{proxy}"
                 proxies = {"http": proxy_formatted, "https": proxy_formatted}
 
-            self._session = AsyncSession(impersonate="chrome120", proxies=proxies)
-            logger.debug(f"Created new curl_cffi AsyncSession (chrome120 TLS) with proxies={bool(proxies)}")
+            self._session = AsyncSession(impersonate="chrome131", proxies=proxies)
+            logger.debug(f"Created new curl_cffi AsyncSession (chrome131 TLS) with proxies={bool(proxies)}")
         if self.reddit_session:
             self._session.cookies.set("reddit_session", self.reddit_session, domain=".reddit.com")
             logger.debug("Ensured custom reddit_session cookie is set in AsyncSession")

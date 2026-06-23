@@ -13,6 +13,25 @@ from urllib.parse import urlparse, urlunparse
 
 app = FastAPI()
 
+@app.on_event("startup")
+async def startup_event():
+    try:
+        import bot.db as db
+        await db.init_db()
+        print("[STARTUP] Database connection initialized successfully.")
+    except Exception as e:
+        print(f"[STARTUP] Error initializing database: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        import bot.db as db
+        await db.close()
+        print("[SHUTDOWN] Database connection closed.")
+    except Exception as e:
+        print(f"[SHUTDOWN] Error closing database: {e}")
+
+
 PROXY_FILE = "proxies.txt"
 PROXIES: List[str] = []
 PROXY_FAILURES: Dict[str, int] = {}
@@ -316,13 +335,13 @@ async def warmup_proxy() -> bool:
                 impersonate=impersonation,
                 proxies=proxies_config,
                 verify=False,
-                timeout=10.0,
+                timeout=20.0,
             ) as session:
                 # Check our current egress IP
                 resp = await session.get(
                     "https://api.ipify.org?format=json",
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=10.0,
+                    timeout=20.0,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
@@ -338,7 +357,7 @@ async def warmup_proxy() -> bool:
                             "Referer": "https://www.reddit.com/",
                             "Cookie": _cookie_str,
                         },
-                        timeout=10.0,
+                        timeout=20.0,
                     )
 
                     if test_resp.status_code == 200:
@@ -366,7 +385,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
     """
     async with _PRIORITY_SEMAPHORE:
         MAX_RETRIES = 3
-        PROXY_TIMEOUT = 12.0
+        PROXY_TIMEOUT = 25.0
         last_err = None
         all_timed_out = True
 
@@ -495,7 +514,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                         url=url,
                         headers=headers,
                         allow_redirects=allow_redirects,
-                        timeout=12.0,
+                        timeout=20.0,
                     )
                 body_lower = resp.text[:2000].lower() if resp.text else ""
                 if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
@@ -1276,6 +1295,197 @@ async def check_post(url: str):
 
     except Exception as e:
         return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=500, media_type="application/json")
+
+
+@app.get("/api/external/check/user/{username}")
+async def check_user_endpoint(username: str):
+    start_time = time.time()
+    try:
+        username = username.strip()
+        url_match = re.search(r"reddit\.com/user/([^/?#\s]+)", username)
+        if url_match:
+            username = url_match.group(1).rstrip("/")
+        else:
+            username = re.sub(r'^/?u/', '', username, flags=re.IGNORECASE).strip().rstrip("/")
+        
+        if not username:
+            return Response(content=json.dumps({"success": False, "message": "Username is required."}), status_code=400, media_type="application/json")
+        
+        fetch_url = f"https://old.reddit.com/user/{username}/about.json?raw_json=1"
+        try:
+            resp = await stealth_fetch(fetch_url)
+        except Exception as e:
+            return Response(content=json.dumps({"success": False, "message": f"Reddit API unreachable: {str(e)}"}), status_code=403, media_type="application/json")
+            
+        if resp.status_code == 200:
+            data = resp.json()
+            user_data = data.get("data", {})
+            is_suspended = user_data.get("is_suspended", False)
+            status = "suspended" if is_suspended else "active"
+            
+            # Check if linked in database
+            import bot.db as db
+            linked = None
+            try:
+                linked = await db.get_user_by_reddit(username)
+            except Exception as dbe:
+                print(f"[DB ERROR] Failed to fetch linked user: {dbe}")
+                
+            # Account age in days calculation
+            created_utc = user_data.get("created_utc", 0)
+            account_age_days = 0
+            if created_utc:
+                account_age_days = int((time.time() - created_utc) / (24 * 3600))
+            
+            result = {
+                "success": True,
+                "data": {
+                    "username": user_data.get("name", username),
+                    "status": status,
+                    "total_karma": user_data.get("total_karma", 0),
+                    "account_age_days": account_age_days,
+                    "verified": bool(linked),
+                    "discord_id": linked["discord_id"] if linked else None
+                }
+            }
+            print(f"[CHECK USER] {username} -> {status} ({int((time.time() - start_time)*1000)}ms)")
+            return Response(content=json.dumps(result), status_code=200, media_type="application/json")
+            
+        elif resp.status_code == 404:
+            # Check shadowbanned vs deleted
+            html_url = f"https://old.reddit.com/user/{username}/"
+            try:
+                html_resp = await stealth_fetch(html_url)
+                if html_resp.status_code == 200:
+                    status = "shadowbanned"
+                else:
+                    status = "deleted"
+            except Exception:
+                status = "deleted"
+                
+            result = {
+                "success": False,
+                "message": "Reddit user not found.",
+                "data": {
+                    "username": username,
+                    "status": status,
+                    "total_karma": 0,
+                    "account_age_days": 0,
+                    "verified": False,
+                    "discord_id": None
+                }
+            }
+            return Response(content=json.dumps(result), status_code=404, media_type="application/json")
+            
+        else:
+            return Response(content=json.dumps({"success": False, "message": f"Reddit API returned HTTP {resp.status_code}"}), status_code=resp.status_code, media_type="application/json")
+            
+    except Exception as e:
+        return Response(content=json.dumps({"success": False, "message": str(e)}), status_code=500, media_type="application/json")
+
+
+class VerifyRequest(BaseModel):
+    discord_id: str
+    reddit_username: str
+
+@app.post("/api/external/verify")
+async def external_verify_endpoint(payload: VerifyRequest):
+    try:
+        discord_id = str(payload.discord_id).strip()
+        raw_username = payload.reddit_username.strip()
+        
+        url_match = re.search(r"reddit\.com/user/([^/?#\s]+)", raw_username)
+        if url_match:
+            reddit_username = url_match.group(1).rstrip("/")
+        else:
+            reddit_username = re.sub(r'^/?u/', '', raw_username, flags=re.IGNORECASE).strip().rstrip("/")
+            
+        if not discord_id or not reddit_username:
+            return Response(content=json.dumps({"success": False, "message": "Both discord_id and reddit_username are required."}), status_code=400, media_type="application/json")
+            
+        # 1. Database validation checks
+        import bot.db as db
+        try:
+            user = await db.get_user(discord_id)
+            if user and user.get("verified"):
+                return Response(content=json.dumps({"success": False, "message": "User is already verified."}), status_code=400, media_type="application/json")
+                
+            if user and user.get("is_flagged"):
+                return Response(content=json.dumps({"success": False, "message": f"Verification blocked: user is flagged. Reason: {user.get('flag_reason')}"}), status_code=400, media_type="application/json")
+                
+            existing = await db.get_user_by_reddit(reddit_username)
+            if existing and existing["discord_id"] != discord_id:
+                return Response(content=json.dumps({"success": False, "message": f"Reddit account u/{reddit_username} is already linked to another Discord user."}), status_code=400, media_type="application/json")
+        except Exception as dbe:
+            print(f"[DB ERROR] Verification DB check failed: {dbe}")
+            
+        # 2. Fetch Reddit metrics
+        fetch_url = f"https://old.reddit.com/user/{reddit_username}/about.json?raw_json=1"
+        try:
+            resp = await stealth_fetch(fetch_url)
+        except Exception as e:
+            return Response(content=json.dumps({"success": False, "message": f"Reddit profile is unreachable or does not exist: {str(e)}"}), status_code=403, media_type="application/json")
+            
+        if resp.status_code != 200:
+            return Response(content=json.dumps({"success": False, "message": "Reddit profile is unreachable or does not exist."}), status_code=404, media_type="application/json")
+            
+        data = resp.json()
+        user_data = data.get("data", {})
+        
+        # Min Requirements
+        total_karma = user_data.get("total_karma", 0)
+        if total_karma < 100:
+            return Response(content=json.dumps({
+                "success": False, 
+                "message": f"Verification failed: u/{reddit_username} has {total_karma} karma (min 100 required)."
+            }), status_code=400, media_type="application/json")
+            
+        created_utc = user_data.get("created_utc", 0)
+        account_age_days = 0
+        if created_utc:
+            account_age_days = int((time.time() - created_utc) / (24 * 3600))
+            
+        if account_age_days < 30:
+            return Response(content=json.dumps({
+                "success": False, 
+                "message": f"Verification failed: u/{reddit_username} is {account_age_days} days old (min 30 required)."
+            }), status_code=400, media_type="application/json")
+            
+        # 3. Save link to DB
+        try:
+            await db.update_user_reddit(discord_id, reddit_username, verified=True)
+            
+            # Check for referrals
+            ref_row = await db.fetchrow(
+                "SELECT * FROM referrals WHERE referee_id = ? AND credited = 0;", discord_id
+            )
+            if ref_row:
+                referrer_id = ref_row["referrer_id"]
+                await db.execute(
+                    "UPDATE users SET balance_available = balance_available + 50.0 WHERE discord_id = ?;",
+                    referrer_id
+                )
+                await db.execute(
+                    "UPDATE referrals SET credited = 1 WHERE referee_id = ?;", discord_id
+                )
+        except Exception as dbe:
+            print(f"[DB ERROR] Verification DB save/referral failed: {dbe}")
+            
+        # 4. Success Response
+        return Response(content=json.dumps({
+            "success": True,
+            "message": "Account verification and linking successful.",
+            "data": {
+                "discord_id": discord_id,
+                "reddit_username": reddit_username,
+                "karma": total_karma,
+                "age_days": account_age_days
+            }
+        }), status_code=200, media_type="application/json")
+        
+    except Exception as e:
+        return Response(content=json.dumps({"success": False, "message": str(e)}), status_code=500, media_type="application/json")
+
 
 
 @app.get("/api/external/check/account")
