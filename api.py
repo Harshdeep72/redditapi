@@ -233,37 +233,16 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
       - Skip the direct (no-proxy) attempt entirely; Hugging Face egress IPs are
         permanently blocked by Reddit / Cloudflare.
       - Try up to MAX_RETRIES proxy attempts.
-      - Circuit breaker: if multiple consecutive all-timeout cycles are detected
-        the proxy is bypassed entirely for CIRCUIT_RESET_SECS (default 5 min)
-        so we fall straight to direct instead of waiting 3 × 5s = 15s.
-      - Only fall back to a direct attempt as a last resort.
-
-    The _PRIORITY_SEMAPHORE limits concurrent calls to 3 slots reserved
-    exclusively for liveness checks — they are NEVER blocked by the inspector.
+      - Cycle through Chrome131, Firefox, and Safari to bypass browser-specific blocks.
+      - Direct fallback is only used as a last resort, also cycling through browser signatures.
     """
     async with _PRIORITY_SEMAPHORE:
-        MAX_RETRIES = 3     # 3 attempts × 12s timeout
-        PROXY_TIMEOUT = 12.0 # Residential proxies (DataImpulse) are often slow, give them 12s
+        MAX_RETRIES = 3
+        PROXY_TIMEOUT = 12.0
         last_err = None
+        all_timed_out = True
 
-        # Build headers once
-        headers = {
-            "Accept": "application/json, text/html, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        }
-
-        # Attach Reddit session cookie when available
-        cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
-        if cookie:
-            headers["Cookie"] = f"reddit_session={cookie}"
-
-        all_timed_out = True  # track whether every attempt was a timeout
-
-        # ------------------------------------------------------------------ #
-        # Phase 1 — Proxy-first attempts  (skip if circuit breaker is open)  #
-        # ------------------------------------------------------------------ #
+        # Phase 1 — Proxy-first attempts (skip if circuit breaker is open)
         if _PROXY_ENABLED and PROXIES and not _is_circuit_open():
             for attempt in range(MAX_RETRIES):
                 if PROXIES and sum(1 for p in PROXIES if PROXY_FAILURES.get(p, 0) >= MAX_PROXY_FAILURES) > len(PROXIES) // 2:
@@ -273,14 +252,40 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                 proxy = get_healthy_proxy()
                 proxies_config = {"http": proxy, "https": proxy} if proxy else None
 
-                # Only back-off when there are multiple proxies to rotate between.
-                # With a single proxy, sleeping just wastes time.
                 if attempt > 0 and len(PROXIES) > 1:
                     sleep_s = min(0.3 * (2 ** (attempt - 1)), 2.0) + random.uniform(0, 0.3)
                     await asyncio.sleep(sleep_s)
 
+                impersonate_target = ["chrome131", "firefox", "safari"][attempt % 3]
+
+                # Build headers dynamically
+                headers = {
+                    "Accept": "application/json, text/html, */*;q=0.9",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Referer": "https://www.reddit.com/",
+                }
+
+                cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
+                if cookie:
+                    headers["Cookie"] = f"reddit_session={cookie}"
+                else:
+                    headers["Cookie"] = "csv=1; over18=1"
+
+                if impersonate_target == "chrome131":
+                    headers.update({
+                        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                        "Sec-Ch-Ua-Mobile": "?0",
+                        "Sec-Ch-Ua-Platform": '"Windows"',
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    })
+
                 try:
-                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as session:
+                    async with cffi_requests.AsyncSession(impersonate=impersonate_target, proxies=proxies_config, verify=False) as session:
                         resp = await session.request(
                             method=method,
                             url=url,
@@ -301,12 +306,12 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     if is_blocked:
                         if proxy:
                             PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                        last_err = f"Proxy blocked (HTTP {resp.status_code})"
+                        last_err = f"Proxy blocked (HTTP {resp.status_code}) under {impersonate_target}"
                         print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} blocked via {proxy}: HTTP {resp.status_code}")
-                        all_timed_out = False  # blocked is different from timed out
+                        all_timed_out = False
                         continue
 
-                    # ✅ Success
+                    # Success
                     if proxy:
                         PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
                     _record_proxy_success()
@@ -319,37 +324,57 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                         all_timed_out = False
                     if proxy:
                         PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                    last_err = f"Proxy error: {type(e).__name__}: {e}"
-                    print(f"[PROXY DEBUG] Bulk proxy fetch failed: {last_err}")
-                    print(f"[PROXY DEBUG] Bulk proxy fetch failed: {last_err}")
+                    last_err = f"Proxy error under {impersonate_target}: {type(e).__name__}: {e}"
                     print(f"[PROXY] attempt {attempt+1}/{MAX_RETRIES} error via {proxy}: {last_err}")
 
-            # All proxy attempts done
             if all_timed_out:
                 _record_proxy_all_timeout()
         else:
             if _is_circuit_open():
                 print(f"[CIRCUIT] Proxy circuit open — skipping proxy, going direct immediately")
 
-        # ------------------------------------------------------------------ #
-        # Phase 2 — Last-resort direct attempt (no proxy)                     #
-        # ------------------------------------------------------------------ #
-        try:
-            print(f"[PROXY] Trying direct fetch.")
-            async with cffi_requests.AsyncSession(impersonate="chrome120") as session:
-                resp = await session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    allow_redirects=allow_redirects,
-                    timeout=12.0,
-                )
-            body_lower = resp.text[:2000].lower() if resp.text else ""
-            if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
-                return resp
-            last_err = f"Direct also blocked (HTTP {resp.status_code})"
-        except Exception as e:
-            last_err = f"Direct error: {type(e).__name__}: {e}"
+        # Phase 2 — Last-resort direct attempt (no proxy)
+        for impersonate_target in ["chrome131", "firefox", "safari"]:
+            try:
+                print(f"[PROXY] Trying direct fetch with {impersonate_target}.")
+                headers = {
+                    "Accept": "application/json, text/html, */*;q=0.9",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Referer": "https://www.reddit.com/",
+                }
+                cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
+                if cookie:
+                    headers["Cookie"] = f"reddit_session={cookie}"
+                else:
+                    headers["Cookie"] = "csv=1; over18=1"
+
+                if impersonate_target == "chrome131":
+                    headers.update({
+                        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                        "Sec-Ch-Ua-Mobile": "?0",
+                        "Sec-Ch-Ua-Platform": '"Windows"',
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    })
+
+                async with cffi_requests.AsyncSession(impersonate=impersonate_target) as session:
+                    resp = await session.request(
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        allow_redirects=allow_redirects,
+                        timeout=12.0,
+                    )
+                body_lower = resp.text[:2000].lower() if resp.text else ""
+                if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
+                    return resp
+                last_err = f"Direct also blocked (HTTP {resp.status_code})"
+            except Exception as e:
+                last_err = f"Direct error: {type(e).__name__}: {e}"
 
         raise Exception(f"All fetch attempts failed. Last error: {last_err}")
 
@@ -363,64 +388,90 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
         if _is_circuit_open():
             raise Exception("Proxy circuit breaker is open: proxy unavailable")
 
-        headers = {
-            "Accept": "application/json, text/html, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Cookie": "over18=1",
-        }
-
         proxy = get_healthy_proxy()
         proxies_config = {"http": proxy, "https": proxy} if proxy else None
 
         async def do_fetch() -> StealthResponse:
-            async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as session:
-                resp = await session.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    allow_redirects=allow_redirects,
-                    timeout=20.0,
-                    stream=(method != "HEAD")
-                )
-                
-                if resp.status_code == 429:
-                    await resp.aclose()
-                    print(f"[BULK] 429 rate-limit on proxy fetch, waiting 60s before retry...")
-                    await asyncio.sleep(60.0)
-                    async with cffi_requests.AsyncSession(impersonate="chrome120", proxies=proxies_config, verify=False) as retry_session:
-                        resp = await retry_session.request(
+            targets = ["chrome131", "firefox", "safari"]
+            last_fetch_err = None
+
+            for impersonate_target in targets:
+                # Build headers dynamically
+                req_headers = {
+                    "Accept": "application/json, text/html, */*;q=0.9",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Connection": "keep-alive",
+                    "Referer": "https://www.reddit.com/",
+                    "Cookie": "csv=1; over18=1",
+                }
+
+                if impersonate_target == "chrome131":
+                    req_headers.update({
+                        "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+                        "Sec-Ch-Ua-Mobile": "?0",
+                        "Sec-Ch-Ua-Platform": '"Windows"',
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    })
+
+                try:
+                    async with cffi_requests.AsyncSession(impersonate=impersonate_target, proxies=proxies_config, verify=False) as session:
+                        resp = await session.request(
                             method=method,
                             url=url,
-                            headers=headers,
+                            headers=req_headers,
                             allow_redirects=allow_redirects,
                             timeout=20.0,
                             stream=(method != "HEAD")
                         )
-                
-                if resp.status_code == 429:
-                    await resp.aclose()
-                    raise Exception("Proxy rate-limited after retry (HTTP 429)")
+                        
+                        # Handle 429 inside the impersonation loop (retry once)
+                        if resp.status_code == 429:
+                            await resp.aclose()
+                            print(f"[BULK] 429 rate-limit on proxy fetch with {impersonate_target}, waiting 60s before retry...")
+                            await asyncio.sleep(60.0)
+                            async with cffi_requests.AsyncSession(impersonate=impersonate_target, proxies=proxies_config, verify=False) as retry_session:
+                                resp = await retry_session.request(
+                                    method=method,
+                                    url=url,
+                                    headers=req_headers,
+                                    allow_redirects=allow_redirects,
+                                    timeout=20.0,
+                                    stream=(method != "HEAD")
+                                )
+                        
+                        if resp.status_code == 429:
+                            await resp.aclose()
+                            raise Exception("Proxy rate-limited after retry (HTTP 429)")
 
-                text_content = ""
-                body_lower = ""
-                if method != "HEAD":
-                    raw_body = await read_stream_limit(resp, limit_bytes=8192)
-                    text_content = raw_body.decode("utf-8", errors="ignore")
-                    body_lower = text_content[:2000].lower()
-                else:
-                    await resp.aclose()
+                        text_content = ""
+                        body_lower = ""
+                        if method != "HEAD":
+                            raw_body = await read_stream_limit(resp, limit_bytes=8192)
+                            text_content = raw_body.decode("utf-8", errors="ignore")
+                            body_lower = text_content[:2000].lower()
+                        else:
+                            await resp.aclose()
 
-                is_blocked = (
-                    resp.status_code in (403, 503, 520, 521, 522, 523, 524)
-                    or "challenge platform" in body_lower
-                    or "just a moment" in body_lower
-                )
-                if is_blocked:
-                    raise Exception(f"Proxy blocked (HTTP {resp.status_code})")
+                        is_blocked = (
+                            resp.status_code in (403, 503, 520, 521, 522, 523, 524)
+                            or "challenge platform" in body_lower
+                            or "just a moment" in body_lower
+                        )
+                        if is_blocked:
+                            raise Exception(f"Blocked (HTTP {resp.status_code})")
 
-                return StealthResponse(resp.status_code, text_content, dict(resp.headers), str(resp.url))
+                        return StealthResponse(resp.status_code, text_content, dict(resp.headers), str(resp.url))
+
+                except Exception as e:
+                    last_fetch_err = e
+                    print(f"[BULK DEBUG] Fetch with {impersonate_target} failed: {e}. Trying next browser...")
+                    continue
+
+            raise Exception(f"All impersonations failed. Last error: {last_fetch_err}")
 
         try:
             res = await do_fetch()
