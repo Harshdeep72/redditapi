@@ -1,1 +1,1 @@
-198043d9696e70135c7d:5f6c46cd4e21569f@gw.dataimpulse.com:823
+socks5h://198043d9696e70135c7d:5f6c46cd4e21569f@gw.dataimpulse.com:824

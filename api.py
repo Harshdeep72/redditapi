@@ -139,18 +139,32 @@ def _record_proxy_success() -> None:
 
 
 def _parse_proxy_lines(lines: list) -> list:
-    """Parse raw proxy strings into normalised URLs."""
+    """Parse raw proxy strings into normalised URLs.
+
+    For DataImpulse port expansions (added internally), we store tuples of
+    (scheme, credentials, host, port) so we can apply the correct scheme.
+    Regular strings are handled as before.
+    """
     formatted = []
     for line in lines:
+        if isinstance(line, tuple):
+            # Internal expansion tuple: (scheme, creds, host, port)
+            scheme, creds, host, port = line
+            if creds:
+                formatted.append(f"{scheme}://{creds}@{host}:{port}")
+            else:
+                formatted.append(f"{scheme}://{host}:{port}")
+            continue
+
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        
+
         # If the user provides a full URL with scheme, keep it
         if line.startswith("http://") or line.startswith("https://") or line.startswith("socks5://") or line.startswith("socks5h://"):
             formatted.append(line)
             continue
-            
+
         # Otherwise, assume http:// and format
         if "@" in line:
             formatted.append(f"http://{line}")
@@ -164,15 +178,54 @@ def _parse_proxy_lines(lines: list) -> list:
     return formatted
 
 
+def _expand_dataimpulse(raw: str, lines: list) -> None:
+    """Expand a DataImpulse proxy string into one entry per supported port/scheme.
+
+    DataImpulse port mapping (SOCKS5 dashboard config, port 824):
+      824  → socks5h:// (SOCKS5 with remote DNS — required for DataImpulse)
+    We also keep 823 as an http:// fallback in case the account supports it.
+    """
+    import re as _re
+    stripped = raw.strip()
+    # Remove scheme if present
+    for pfx in ("socks5h://", "socks5://", "http://", "https://"):
+        if stripped.lower().startswith(pfx):
+            stripped = stripped[len(pfx):]
+            break
+    # Remove trailing :port
+    stripped = _re.sub(r':\d+$', '', stripped)
+    # stripped is now:  user:pass@gw.dataimpulse.com
+    if "@" in stripped:
+        creds, host = stripped.rsplit("@", 1)
+    else:
+        creds, host = "", stripped
+
+    port_map = {
+        "824":  "socks5h",   # DataImpulse SOCKS5 (remote DNS)
+        "823":  "http",      # fallback HTTP proxy
+    }
+    for port, scheme in port_map.items():
+        lines.append((scheme, creds, host, port))
+
+
 def load_proxies():
-    """Load proxies from proxies.txt and/or PROXY_LIST_URL env var (one proxy per line)."""
+    """Load proxies with DataImpulse multi-gateway support."""
     global PROXIES, IS_SINGLE_ROTATING_GATEWAY
     lines = []
+
+    _is_di = lambda s: "dataimpulse" in s.lower()
 
     # Source 1: local proxies.txt
     if os.path.exists(PROXY_FILE):
         with open(PROXY_FILE, "r", encoding="utf-8") as f:
-            lines += [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            for l in f:
+                stripped = l.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if _is_di(stripped):
+                    _expand_dataimpulse(stripped, lines)
+                else:
+                    lines.append(stripped)
 
     # Source 2: PROXY_LIST_URL — fetches one proxy per line from a remote URL
     proxy_list_url = os.environ.get("PROXY_LIST_URL", "").strip()
@@ -181,7 +234,14 @@ def load_proxies():
             import urllib.request
             with urllib.request.urlopen(proxy_list_url, timeout=10) as resp:
                 remote_lines = resp.read().decode("utf-8").splitlines()
-            lines += [l.strip() for l in remote_lines if l.strip() and not l.strip().startswith("#")]
+            for l in remote_lines:
+                stripped = l.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if _is_di(stripped):
+                    _expand_dataimpulse(stripped, lines)
+                else:
+                    lines.append(stripped)
             print(f"[PROXY] Fetched {len(remote_lines)} lines from PROXY_LIST_URL.")
         except Exception as e:
             print(f"[PROXY] WARNING: Could not fetch PROXY_LIST_URL: {e}")
@@ -189,41 +249,106 @@ def load_proxies():
     # Source 3: PROXY_STRING — a direct rotating proxy string (e.g., DataImpulse gateway)
     proxy_string = os.environ.get("PROXY_STRING", "").strip()
     if proxy_string:
-        lines.append(proxy_string)
-        if "gateway.dataimpulse.com" in proxy_string or "dataimpulse.com:823" in proxy_string or "gw.dataimpulse.com" in proxy_string:
+        if _is_di(proxy_string):
             IS_SINGLE_ROTATING_GATEWAY = True
-            print("[PROXY] Detected single rotating gateway (DataImpulse) in PROXY_STRING. Rotation disabled.")
+            _expand_dataimpulse(proxy_string, lines)
+            print("[PROXY] Loaded DataImpulse gateway from PROXY_STRING — expanded to ports 823/824/1080.")
         else:
+            lines.append(proxy_string)
             print("[PROXY] Loaded single rotating gateway from PROXY_STRING.")
 
     PROXIES = _parse_proxy_lines(lines)
-    
+
     # Enable single gateway mode if we only have 1 proxy or if any proxy is DataImpulse
-    if len(PROXIES) == 1 or any("dataimpulse" in p or ":823" in p for p in PROXIES):
+    if len(PROXIES) == 1 or any("dataimpulse" in p for p in PROXIES):
         IS_SINGLE_ROTATING_GATEWAY = True
 
     if not IS_SINGLE_ROTATING_GATEWAY and len(PROXIES) > 1:
         random.shuffle(PROXIES)
     print(f"Loaded {len(PROXIES)} proxies total. IS_SINGLE_ROTATING_GATEWAY={IS_SINGLE_ROTATING_GATEWAY}")
+    for p in PROXIES:
+        print(f"  [PROXY] {p}")
 
 load_proxies()
 
 
 def get_healthy_proxy() -> Optional[str]:
+    """Get next proxy in round-robin fashion (for multi-proxy) or the only one."""
     global PROXY_INDEX
     if not PROXIES:
         return None
-    if IS_SINGLE_ROTATING_GATEWAY:
-        # Always use the gateway, DataImpulse handles rotation internally per connection
-        return PROXIES[-1]
-    healthy = [p for p in PROXIES if PROXY_FAILURES.get(p, 0) < MAX_PROXY_FAILURES]
-    if not healthy:
-        # If all fail, reset failures and try again
-        PROXY_FAILURES.clear()
-        healthy = PROXIES
-    proxy = healthy[PROXY_INDEX % len(healthy)]
+    
+    if IS_SINGLE_ROTATING_GATEWAY and len(PROXIES) == 1:
+        return PROXIES[0]
+        
+    for _ in range(len(PROXIES)):
+        proxy = PROXIES[PROXY_INDEX % len(PROXIES)]
+        PROXY_INDEX += 1
+        if PROXY_FAILURES.get(proxy, 0) < MAX_PROXY_FAILURES:
+            return proxy
+            
+    PROXY_FAILURES.clear()
+    proxy = PROXIES[PROXY_INDEX % len(PROXIES)]
     PROXY_INDEX += 1
     return proxy
+
+
+_WARMUP_DONE = False
+
+async def warmup_proxy() -> bool:
+    """
+    Force DataImpulse to give us a fresh egress IP by making a request
+    to a neutral site that returns our IP. If the IP is blacklisted,
+    we retry with a different proxy configuration.
+    """
+    proxy = get_healthy_proxy()
+    if not proxy:
+        return False
+    
+    proxies_config = {"http": proxy, "https": proxy}
+    
+    # Try different impersonations to force a new egress IP
+    for impersonation in ["chrome131", "firefox", "safari"]:
+        try:
+            async with cffi_requests.AsyncSession(
+                impersonate=impersonation,
+                proxies=proxies_config,
+                verify=False,
+                timeout=10.0,
+            ) as session:
+                # Check our current egress IP
+                resp = await session.get(
+                    "https://api.ipify.org?format=json",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    current_ip = data.get("ip", "unknown")
+                    print(f"[WARMUP] Current egress IP: {current_ip}")
+                    
+                    # Test if this IP is blocked by Reddit
+                    test_resp = await session.get(
+                        "https://old.reddit.com/r/all/.json?limit=0",
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            "Accept": "application/json",
+                            "Cookie": "csv=1; over18=1",
+                        },
+                        timeout=10.0,
+                    )
+                    
+                    if test_resp.status_code == 200:
+                        print(f"[WARMUP] ✅ Proxy IP {current_ip} works with Reddit")
+                        return True
+                    elif test_resp.status_code == 403:
+                        print(f"[WARMUP] ❌ Proxy IP {current_ip} is blocked by Reddit, forcing rotation...")
+                        continue
+        except Exception as e:
+            print(f"[WARMUP] Error: {e}")
+            continue
+    
+    return False
 
 async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
     """
@@ -391,23 +516,20 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
         proxy = get_healthy_proxy()
         proxies_config = {"http": proxy, "https": proxy} if proxy else None
 
-        async def do_fetch() -> StealthResponse:
-            targets = ["chrome131", "firefox", "safari"]
-            last_fetch_err = None
-
-            for impersonate_target in targets:
-                # Build headers dynamically
-                req_headers = {
+        def _build_reddit_headers(impersonate_target: str) -> dict:
+                """Build Reddit-compatible headers, always injecting the session cookie."""
+                cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION", "")
+                cookie_str = f"reddit_session={cookie}; over18=1; csv=1" if cookie else "csv=1; over18=1"
+                h = {
                     "Accept": "application/json, text/html, */*;q=0.9",
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "gzip, deflate, br",
                     "Connection": "keep-alive",
                     "Referer": "https://www.reddit.com/",
-                    "Cookie": "csv=1; over18=1",
+                    "Cookie": cookie_str,
                 }
-
                 if impersonate_target == "chrome131":
-                    req_headers.update({
+                    h.update({
                         "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
                         "Sec-Ch-Ua-Mobile": "?0",
                         "Sec-Ch-Ua-Platform": '"Windows"',
@@ -416,41 +538,57 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
                         "Sec-Fetch-Site": "same-origin",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                     })
+                return h
 
+        async def _do_one_fetch(proxies_cfg: Optional[dict], label: str) -> StealthResponse:
+            """Attempt fetch with a given proxy config (or None for direct)."""
+            targets = ["chrome131", "firefox", "safari"]
+            last_fetch_err = None
+
+            for impersonate_target in targets:
+                req_headers = _build_reddit_headers(impersonate_target)
                 try:
-                    async with cffi_requests.AsyncSession(impersonate=impersonate_target, proxies=proxies_config, verify=False) as session:
+                    async with cffi_requests.AsyncSession(
+                        impersonate=impersonate_target,
+                        proxies=proxies_cfg,
+                        verify=False,
+                    ) as session:
                         resp = await session.request(
                             method=method,
                             url=url,
                             headers=req_headers,
                             allow_redirects=allow_redirects,
                             timeout=20.0,
-                            stream=(method != "HEAD")
+                            stream=(method != "HEAD"),
                         )
-                        
-                        # Handle 429 inside the impersonation loop (retry once)
+
+                        # Handle 429 with a 60s back-off then one retry
                         if resp.status_code == 429:
                             await resp.aclose()
-                            print(f"[BULK] 429 rate-limit on proxy fetch with {impersonate_target}, waiting 60s before retry...")
+                            print(f"[BULK] 429 on {label}/{impersonate_target}, waiting 60s…")
                             await asyncio.sleep(60.0)
-                            async with cffi_requests.AsyncSession(impersonate=impersonate_target, proxies=proxies_config, verify=False) as retry_session:
-                                resp = await retry_session.request(
+                            async with cffi_requests.AsyncSession(
+                                impersonate=impersonate_target,
+                                proxies=proxies_cfg,
+                                verify=False,
+                            ) as rs:
+                                resp = await rs.request(
                                     method=method,
                                     url=url,
                                     headers=req_headers,
                                     allow_redirects=allow_redirects,
                                     timeout=20.0,
-                                    stream=(method != "HEAD")
+                                    stream=(method != "HEAD"),
                                 )
-                        
+
                         if resp.status_code == 429:
                             await resp.aclose()
-                            raise Exception("Proxy rate-limited after retry (HTTP 429)")
+                            raise Exception(f"{label} rate-limited after retry (HTTP 429)")
 
                         text_content = ""
                         body_lower = ""
                         if method != "HEAD":
-                            raw_body = await read_stream_limit(resp, limit_bytes=8192)
+                            raw_body = await read_stream_limit(resp, limit_bytes=MAX_RESPONSE_BYTES)
                             text_content = raw_body.decode("utf-8", errors="ignore")
                             body_lower = text_content[:2000].lower()
                         else:
@@ -462,32 +600,47 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
                             or "just a moment" in body_lower
                         )
                         if is_blocked:
-                            raise Exception(f"Blocked (HTTP {resp.status_code})")
+                            raise Exception(f"Blocked (HTTP {resp.status_code}) via {label}")
 
-                        return StealthResponse(resp.status_code, text_content, dict(resp.headers), str(resp.url))
+                        return StealthResponse(
+                            resp.status_code, text_content, dict(resp.headers), str(resp.url)
+                        )
 
                 except Exception as e:
                     last_fetch_err = e
-                    print(f"[BULK DEBUG] Fetch with {impersonate_target} failed: {e}. Trying next browser...")
+                    print(f"[BULK DEBUG] {label}/{impersonate_target} failed: {e}. Trying next…")
                     continue
 
-            raise Exception(f"All impersonations failed. Last error: {last_fetch_err}")
+            raise Exception(f"All impersonations failed via {label}. Last: {last_fetch_err}")
 
+        # --- Phase 1: proxy attempt (skip if circuit open or no proxy) ---
+        proxy_err: Optional[str] = None
+        if _PROXY_ENABLED and proxies_config and not _is_circuit_open():
+            try:
+                res = await _do_one_fetch(proxies_config, "proxy")
+                if proxy and not IS_SINGLE_ROTATING_GATEWAY:
+                    PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
+                _record_proxy_success()
+                return res
+            except Exception as e:
+                proxy_err = str(e)
+                is_timeout = "timeout" in proxy_err.lower() or "timed out" in proxy_err.lower() or "28" in proxy_err
+                if is_timeout:
+                    _record_proxy_all_timeout()
+                if proxy and not IS_SINGLE_ROTATING_GATEWAY:
+                    PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
+                print(f"[PROXY DEBUG] Bulk proxy fetch failed: {proxy_err}. Falling back to direct…")
+
+        # --- Phase 2: direct fallback (always uses session cookie) ---
         try:
-            res = await do_fetch()
-            if proxy and not IS_SINGLE_ROTATING_GATEWAY:
-                PROXY_FAILURES[proxy] = max(0, PROXY_FAILURES.get(proxy, 0) - 1)
-            _record_proxy_success()
+            print(f"[BULK] Using direct (no-proxy) fallback for {url}")
+            res = await _do_one_fetch(None, "direct")
             return res
         except Exception as e:
-            err_str = str(e)
-            is_timeout = "timeout" in err_str.lower() or "timed out" in err_str.lower() or "28" in err_str
-            if is_timeout:
-                _record_proxy_all_timeout()
-            if proxy and not IS_SINGLE_ROTATING_GATEWAY:
-                PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-            print(f"[PROXY DEBUG] Bulk proxy fetch failed: {err_str}")
-            raise Exception(f"Bulk fetch failed. Last error: {err_str}")
+            final_err = str(e)
+            raise Exception(
+                f"Bulk fetch failed (proxy: {proxy_err or 'skipped'}; direct: {final_err})"
+            )
 
 
 
@@ -750,6 +903,10 @@ async def bulk_check(request: Request):
 
     if not urls:
         return Response(content=json.dumps({"error": "No URLs provided"}), status_code=400, media_type="application/json")
+
+    # Warm up proxies to acquire a working egress IP for Reddit
+    print("[BULK] Warming up proxy to find working egress IP...")
+    await warmup_proxy()
 
     # Run checks sequentially in chunks of 20
     chunk_size = 20
