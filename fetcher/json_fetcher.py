@@ -16,7 +16,7 @@ from fetcher.session import RedditSession
 
 logger = logging.getLogger(__name__)
 
-REDDIT_BASE = "https://www.reddit.com"
+REDDIT_BASE = "https://old.reddit.com"
 
 
 def _clean_username(username: str) -> str:

@@ -6,6 +6,7 @@ and manual moderator review channels for Reddit u/ username verification.
 from __future__ import annotations
 
 import logging
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -117,7 +118,7 @@ class RedditVerificationModal(discord.ui.Modal, title="Link Reddit Profile"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True, ephemeral=True)
-        username = self.reddit_name.value.strip().lstrip("u/").lstrip("/u/")
+        username = re.sub(r'^/?u/', '', self.reddit_name.value.strip(), flags=re.IGNORECASE).strip().rstrip("/")
         discord_id = str(interaction.user.id)
 
         # 1. Database sanity checks

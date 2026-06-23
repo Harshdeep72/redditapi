@@ -27,15 +27,9 @@ logger = logging.getLogger(__name__)
 # How often to re-acquire fresh cookies (seconds)
 COOKIE_REFRESH_INTERVAL = 600  # 10 minutes
 
-# Reddit URLs used for cookie bootstrapping
-BOOTSTRAP_URLS = [
-    "https://www.reddit.com/",
-    "https://www.reddit.com/r/popular/",
-]
+# curl_cffi with impersonate="chrome131" automatically handles User-Agent and TLS
+# fingerprinting — no manual USER_AGENTS list needed.
 
-# Removed hardcoded USER_AGENTS and custom header dicts. 
-# curl_cffi with impersonate="chrome120" automatically handles all of this
-# far better than hardcoded dictionaries, and prevents JA3 fingerprint mismatches.
 
 
 class RedditSession:
@@ -93,8 +87,9 @@ class RedditSession:
         if self.proxy_list_url and not self._proxies_fetched:
             try:
                 import aiohttp
+                timeout = aiohttp.ClientTimeout(total=10)
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(self.proxy_list_url, timeout=10) as resp:
+                    async with s.get(self.proxy_list_url, timeout=timeout) as resp:
                         if resp.status == 200:
                             text = await resp.text()
                             lines = text.splitlines()
@@ -286,9 +281,9 @@ class RedditSession:
                 if attempt == 0:
                     logger.warning("403 on %s — re-acquiring cookies and retrying.", url)
                     self._cookies_ready = False
-                    self._user_agent = random.choice(USER_AGENTS)
+                    # curl_cffi handles User-Agent internally; just rotate proxy
                     if self.proxy_list:
-                        await self.close() # Force proxy rotation
+                        await self.close()  # Force proxy rotation
                     await self._maybe_refresh_cookies()
                     await asyncio.sleep(random.uniform(2, 5))
                     return await self.get_json(url, params, referer, attempt + 1)

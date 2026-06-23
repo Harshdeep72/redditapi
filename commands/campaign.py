@@ -7,6 +7,7 @@ Allows administrators to parse and import structured campaign templates
 from __future__ import annotations
 
 import logging
+import re
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -49,7 +50,8 @@ def parse_campaign_text(text: str) -> dict[str, Any] | None:
         if lower_line.startswith("keyword"):
             campaign["keyword"] = line.split(":", 1)[-1].strip()
         elif lower_line.startswith("subreddit"):
-            campaign["subreddit"] = line.split(":", 1)[-1].strip().lstrip("r/").lstrip("/r/")
+            raw_sub = line.split(":", 1)[-1].strip()
+            campaign["subreddit"] = re.sub(r'^/?r/', '', raw_sub, flags=re.IGNORECASE).strip().rstrip("/")
         elif lower_line.startswith("title"):
             campaign["title"] = line.split(":", 1)[-1].strip()
         elif lower_line.startswith("content"):

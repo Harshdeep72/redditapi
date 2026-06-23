@@ -252,7 +252,7 @@ def load_proxies():
         if _is_di(proxy_string):
             IS_SINGLE_ROTATING_GATEWAY = True
             _expand_dataimpulse(proxy_string, lines)
-            print("[PROXY] Loaded DataImpulse gateway from PROXY_STRING — expanded to ports 823/824/1080.")
+            print("[PROXY] Loaded DataImpulse gateway from PROXY_STRING — expanded to ports 823/824.")
         else:
             lines.append(proxy_string)
             print("[PROXY] Loaded single rotating gateway from PROXY_STRING.")
@@ -304,9 +304,11 @@ async def warmup_proxy() -> bool:
     proxy = get_healthy_proxy()
     if not proxy:
         return False
-    
+
     proxies_config = {"http": proxy, "https": proxy}
-    
+    _cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION", "")
+    _cookie_str = f"reddit_session={_cookie}; over18=1; csv=1" if _cookie else "csv=1; over18=1"
+
     # Try different impersonations to force a new egress IP
     for impersonation in ["chrome131", "firefox", "safari"]:
         try:
@@ -326,18 +328,19 @@ async def warmup_proxy() -> bool:
                     data = resp.json()
                     current_ip = data.get("ip", "unknown")
                     print(f"[WARMUP] Current egress IP: {current_ip}")
-                    
-                    # Test if this IP is blocked by Reddit
+
+                    # Test if this IP is unblocked by Reddit (with session cookie)
                     test_resp = await session.get(
                         "https://old.reddit.com/r/all/.json?limit=0",
                         headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                            "Accept": "application/json",
-                            "Cookie": "csv=1; over18=1",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                            "Accept": "application/json, text/html, */*;q=0.9",
+                            "Referer": "https://www.reddit.com/",
+                            "Cookie": _cookie_str,
                         },
                         timeout=10.0,
                     )
-                    
+
                     if test_resp.status_code == 200:
                         print(f"[WARMUP] ✅ Proxy IP {current_ip} works with Reddit")
                         return True
@@ -347,7 +350,7 @@ async def warmup_proxy() -> bool:
         except Exception as e:
             print(f"[WARMUP] Error: {e}")
             continue
-    
+
     return False
 
 async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = True) -> cffi_requests.Response:
@@ -394,7 +397,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
 
                 cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
                 if cookie:
-                    headers["Cookie"] = f"reddit_session={cookie}"
+                    headers["Cookie"] = f"reddit_session={cookie}; over18=1; csv=1"
                 else:
                     headers["Cookie"] = "csv=1; over18=1"
 
@@ -629,7 +632,12 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
                     _record_proxy_all_timeout()
                 if proxy and not IS_SINGLE_ROTATING_GATEWAY:
                     PROXY_FAILURES[proxy] = PROXY_FAILURES.get(proxy, 0) + 1
-                print(f"[PROXY DEBUG] Bulk proxy fetch failed: {proxy_err}. Falling back to direct…")
+                print(f"[PROXY DEBUG] Bulk proxy fetch failed: {proxy_err}.")
+        
+        if _PROXY_ENABLED:
+            raise Exception(
+                f"Bulk fetch failed: Proxy attempt failed/skipped ({proxy_err or 'no proxies or circuit open'}). Direct fallback is disabled for bulk checks."
+            )
 
         # --- Phase 2: direct fallback (always uses session cookie) ---
         try:
@@ -639,7 +647,7 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
         except Exception as e:
             final_err = str(e)
             raise Exception(
-                f"Bulk fetch failed (proxy: {proxy_err or 'skipped'}; direct: {final_err})"
+                f"Bulk fetch failed (proxy: skipped; direct: {final_err})"
             )
 
 
@@ -678,8 +686,10 @@ async def _bulk_check_single(url: str) -> dict:
                     if r.url and str(r.url) != url:
                         resolved = str(r.url)
                         set_in_cache(SHORTLINK_CACHE, url, resolved)
-                except Exception:
-                    pass
+                    else:
+                        return {"url": url, "type": "unknown", "error": "Failed to resolve shortlink: Link did not redirect", "data": None}
+                except Exception as e:
+                    return {"url": url, "type": "unknown", "error": f"Failed to resolve shortlink: {str(e)}", "data": None}
 
         # Strip query string + trailing slash
         clean = resolved.split("?")[0].rstrip("/")
@@ -904,9 +914,11 @@ async def bulk_check(request: Request):
     if not urls:
         return Response(content=json.dumps({"error": "No URLs provided"}), status_code=400, media_type="application/json")
 
-    # Warm up proxies to acquire a working egress IP for Reddit
-    print("[BULK] Warming up proxy to find working egress IP...")
-    await warmup_proxy()
+    # Warm up proxies once per process to acquire a working egress IP for Reddit
+    global _WARMUP_DONE
+    if not _WARMUP_DONE:
+        print("[BULK] Warming up proxy to find working egress IP...")
+        _WARMUP_DONE = await warmup_proxy()
 
     # Run checks sequentially in chunks of 20
     chunk_size = 20
@@ -1270,7 +1282,12 @@ async def check_post(url: str):
 async def check_account(username: str, include_activity: bool = False):
     start_time = time.time()
     try:
-        username = username.lstrip("u/").split("/")[-1]
+        username = username.strip()
+        url_match = re.search(r"reddit\.com/user/([^/?#\s]+)", username)
+        if url_match:
+            username = url_match.group(1).rstrip("/")
+        else:
+            username = re.sub(r'^/?u/', '', username, flags=re.IGNORECASE).strip().rstrip("/")
         
         fetch_url = f"https://old.reddit.com/user/{username}/about.json?raw_json=1"
         try:
@@ -1412,7 +1429,7 @@ async def health():
 
 
 @app.post("/reload-proxies")
-async def reload_proxies_endpoint():
+async def reload_proxies_legacy_endpoint():
     """Reload proxy list from proxies.txt + PROXY_LIST_URL without restarting."""
     old_count = len(PROXIES)
     PROXY_FAILURES.clear()

@@ -1,0 +1,25 @@
+# Secrets — never bake into Docker image
+.env
+.env.*
+
+# Dev artifacts
+venv/
+__pycache__/
+*.pyc
+*.pyo
+scratch/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Test files
+test_*.py
+*_test.py
+
+# Local temp/data
+data/
+*.xlsx
+new_proxies.txt
+working_proxies.txt

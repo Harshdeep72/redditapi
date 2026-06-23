@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import json
 import os
 import hashlib
@@ -2704,7 +2705,12 @@ async def handle_check_users(request: web.Request) -> web.Response:
         results = []
 
         async def check_user(username: str) -> dict[str, Any]:
-            username = username.strip().lstrip("u/").lstrip("/u/")
+            username = username.strip()
+            url_match = re.search(r"reddit\.com/user/([^/?#\s]+)", username)
+            if url_match:
+                username = url_match.group(1).rstrip("/")
+            else:
+                username = re.sub(r'^/?u/', '', username, flags=re.IGNORECASE).strip().rstrip("/")
             if not username:
                 return {"username": "", "status": "invalid"}
             try:
@@ -2929,7 +2935,12 @@ async def handle_check_single_link(request: web.Request) -> web.Response:
 async def handle_external_check_user(request: web.Request) -> web.Response:
     """Check a single Reddit username for status, karma, age, and link status."""
     try:
-        username = request.match_info.get("username", "").strip().lstrip("u/").lstrip("/u/")
+        raw_username = request.match_info.get("username", "").strip()
+        url_match = re.search(r"reddit\.com/user/([^/?#\s]+)", raw_username)
+        if url_match:
+            username = url_match.group(1).rstrip("/")
+        else:
+            username = re.sub(r'^/?u/', '', raw_username, flags=re.IGNORECASE).strip().rstrip("/")
         if not username:
             return web.json_response({"success": False, "message": "Username is required."}, status=400)
             
@@ -3042,7 +3053,12 @@ async def handle_external_verify(request: web.Request) -> web.Response:
     try:
         data = await request.json()
         discord_id = str(data.get("discord_id", "")).strip()
-        reddit_username = data.get("reddit_username", "").strip().lstrip("u/").lstrip("/u/")
+        raw_username = data.get("reddit_username", "").strip()
+        url_match = re.search(r"reddit\.com/user/([^/?#\s]+)", raw_username)
+        if url_match:
+            reddit_username = url_match.group(1).rstrip("/")
+        else:
+            reddit_username = re.sub(r'^/?u/', '', raw_username, flags=re.IGNORECASE).strip().rstrip("/")
         
         if not discord_id or not reddit_username:
             return web.json_response({"success": False, "message": "Both discord_id and reddit_username are required."}, status=400)
