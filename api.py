@@ -312,9 +312,11 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
             "Accept-Encoding": "gzip, deflate, br",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
-        cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
-        if cookie:
-            headers["Cookie"] = f"reddit_session={cookie}"
+        # Do NOT use REDDIT_SESSION for bulk checks!
+        # Sending the same session cookie from 50 different IP addresses simultaneously
+        # triggers Reddit's anti-bot system and rate-limits the account.
+        # Instead, we just inject a generic over18=1 cookie to bypass NSFW gates.
+        headers["Cookie"] = "over18=1"
 
         all_timed_out = True
 
