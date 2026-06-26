@@ -1030,19 +1030,21 @@ async def resolve_url(url: str) -> str:
         if "redd.it" in url or "/s/" in url:
             resolved = False
             
-            # Step 1: Try HEAD with allow_redirects=True
+            # Step 1: Try direct HEAD with allow_redirects=True
             try:
-                resp = await stealth_fetch(url, method="HEAD", allow_redirects=True)
+                async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                    resp = await session.request("HEAD", url, allow_redirects=True, timeout=10)
                 if resp.url and str(resp.url) != url and "redd.it" not in str(resp.url) and "/s/" not in str(resp.url):
                     url = str(resp.url)
                     resolved = True
             except Exception:
                 pass
                 
-            # Step 2: Try GET with allow_redirects=True
+            # Step 2: Try direct GET with allow_redirects=True
             if not resolved:
                 try:
-                    resp = await stealth_fetch(url, method="GET", allow_redirects=True)
+                    async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                        resp = await session.request("GET", url, allow_redirects=True, timeout=10)
                     if resp.url and str(resp.url) != url and "redd.it" not in str(resp.url) and "/s/" not in str(resp.url):
                         url = str(resp.url)
                         resolved = True
