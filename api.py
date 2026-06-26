@@ -42,6 +42,9 @@ FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "tota
 # direct on every request.  Useful when the proxy port is firewalled by the
 # hosting provider (e.g. port 823 is blocked from Hugging Face).
 _PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+if not _PROXY_ENABLED and (os.environ.get("PROXY_STRING") or os.environ.get("PROXY_LIST_URL")):
+    print("[PROXY] Overriding PROXY_ENABLED=false because PROXY_STRING or PROXY_LIST_URL is configured.")
+    _PROXY_ENABLED = True
 if not _PROXY_ENABLED:
     print("[PROXY] PROXY_ENABLED=false — all requests will go direct (no proxy).")
 
@@ -1651,4 +1654,58 @@ async def reload_proxies_legacy_endpoint():
             "proxies_after": len(PROXIES),
         }),
         status_code=200, media_type="application/json"
+    )
+
+
+@app.get("/api/external/resolve")
+async def resolve_endpoint(url: str):
+    """Resolve share links using the proxy-based resolve_url logic."""
+    try:
+        resolved_url = await resolve_url(url)
+        return Response(
+            content=json.dumps({"success": True, "url": resolved_url}),
+            status_code=200,
+            media_type="application/json"
+        )
+    except Exception as e:
+        return Response(
+            content=json.dumps({"success": False, "message": str(e)}),
+            status_code=400,
+            media_type="application/json"
+        )
+
+
+@app.get("/api/external/debug-proxy")
+async def debug_proxy_endpoint():
+    """Diagnose proxy status by making requests to httpbin.org from inside Hugging Face."""
+    results = []
+    # 1. Direct connection
+    try:
+        async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+            resp = await session.request("GET", "https://httpbin.org/ip", timeout=10)
+            results.append({"type": "direct", "status": resp.status_code, "text": resp.text.strip()})
+    except Exception as e:
+        results.append({"type": "direct", "error": f"{type(e).__name__}: {str(e)}"})
+
+    # 2. Try all proxies
+    for i, p in enumerate(PROXIES):
+        proxies_config = {"http": p, "https": p}
+        try:
+            async with cffi_requests.AsyncSession(impersonate="chrome131", proxies=proxies_config) as session:
+                resp = await session.request("GET", "https://httpbin.org/ip", timeout=10)
+                results.append({"type": f"proxy_{i}", "proxy": p, "status": resp.status_code, "text": resp.text.strip()})
+        except Exception as e:
+            results.append({"type": f"proxy_{i}", "proxy": p, "error": f"{type(e).__name__}: {str(e)}"})
+
+    return Response(
+        content=json.dumps({
+            "results": results,
+            "proxy_enabled_env": os.environ.get("PROXY_ENABLED"),
+            "proxy_enabled_global": _PROXY_ENABLED,
+            "proxy_string_exists": bool(os.environ.get("PROXY_STRING")),
+            "proxy_list_url_exists": bool(os.environ.get("PROXY_LIST_URL")),
+            "proxy_total": len(PROXIES)
+        }),
+        status_code=200,
+        media_type="application/json"
     )
