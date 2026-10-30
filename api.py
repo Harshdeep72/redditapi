@@ -1027,11 +1027,16 @@ async def resolve_url(url: str) -> str:
         # If it's a share link or redd.it link, resolve it
         if "redd.it" in url or "/s/" in url:
             resolved = False
+            req_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://www.reddit.com/",
+            }
             
             # Step 1: Try HEAD with allow_redirects=False (read 301/302 location header directly)
             try:
                 async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
-                    resp = await session.request("HEAD", url, allow_redirects=False, timeout=10)
+                    resp = await session.request("HEAD", url, headers=req_headers, allow_redirects=False, timeout=10)
                 loc = resp.headers.get("location") or resp.headers.get("Location")
                 if loc and "redd.it" not in loc and "/s/" not in loc:
                     url = loc if loc.startswith("http") else urljoin(url, loc)
@@ -1043,7 +1048,7 @@ async def resolve_url(url: str) -> str:
             if not resolved:
                 try:
                     async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
-                        resp = await session.request("GET", url, allow_redirects=False, timeout=10)
+                        resp = await session.request("GET", url, headers=req_headers, allow_redirects=False, timeout=10)
                     loc = resp.headers.get("location") or resp.headers.get("Location")
                     if loc and "redd.it" not in loc and "/s/" not in loc:
                         url = loc if loc.startswith("http") else urljoin(url, loc)
@@ -1055,7 +1060,7 @@ async def resolve_url(url: str) -> str:
             if not resolved:
                 try:
                     async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
-                        resp = await session.request("GET", url, allow_redirects=True, timeout=10)
+                        resp = await session.request("GET", url, headers=req_headers, allow_redirects=True, timeout=10)
                     if resp.url and str(resp.url) != url and "redd.it" not in str(resp.url) and "/s/" not in str(resp.url):
                         url = str(resp.url)
                         resolved = True
