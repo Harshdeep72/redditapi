@@ -407,7 +407,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
 
                 # Build headers dynamically
                 headers = {
-                    "Accept": "application/json, text/html, */*;q=0.9",
+                    "Accept": "application/json",
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "gzip, deflate, br",
                     "Connection": "keep-alive",
@@ -485,7 +485,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
             try:
                 print(f"[PROXY] Trying direct fetch with {impersonate_target}.")
                 headers = {
-                    "Accept": "application/json, text/html, */*;q=0.9",
+                    "Accept": "application/json",
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "gzip, deflate, br",
                     "Connection": "keep-alive",
@@ -1021,23 +1021,37 @@ async def bulk_check(request: Request):
 async def resolve_url(url: str) -> str:
     """Resolve shortlinks and normalize reddit URLs."""
     try:
+        from urllib.parse import urljoin
         parsed = urlparse(url)
         
         # If it's a share link or redd.it link, resolve it
         if "redd.it" in url or "/s/" in url:
             resolved = False
             
-            # Step 1: Try direct HEAD with allow_redirects=True
+            # Step 1: Try HEAD with allow_redirects=False (read 301/302 location header directly)
             try:
                 async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
-                    resp = await session.request("HEAD", url, allow_redirects=True, timeout=10)
-                if resp.url and str(resp.url) != url and "redd.it" not in str(resp.url) and "/s/" not in str(resp.url):
-                    url = str(resp.url)
+                    resp = await session.request("HEAD", url, allow_redirects=False, timeout=10)
+                loc = resp.headers.get("location") or resp.headers.get("Location")
+                if loc and "redd.it" not in loc and "/s/" not in loc:
+                    url = loc if loc.startswith("http") else urljoin(url, loc)
                     resolved = True
             except Exception:
                 pass
                 
-            # Step 2: Try direct GET with allow_redirects=True
+            # Step 2: Try GET with allow_redirects=False
+            if not resolved:
+                try:
+                    async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                        resp = await session.request("GET", url, allow_redirects=False, timeout=10)
+                    loc = resp.headers.get("location") or resp.headers.get("Location")
+                    if loc and "redd.it" not in loc and "/s/" not in loc:
+                        url = loc if loc.startswith("http") else urljoin(url, loc)
+                        resolved = True
+                except Exception:
+                    pass
+
+            # Step 3: Try GET with allow_redirects=True
             if not resolved:
                 try:
                     async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
@@ -1069,12 +1083,8 @@ async def resolve_url(url: str) -> str:
             if "/s/" in url and "/comments/" not in url:
                 raise ValueError("Share link resolved to invalid URL (no /comments/ path found)")
                 
-        # Normalize to old.reddit.com
-        parsed = urlparse(url)
-        if parsed.netloc in ["reddit.com", "www.reddit.com"]:
-            url = url.replace(parsed.netloc, "old.reddit.com")
-            
         # Strip query params like js_challenge, token, etc.
+        # Keep canonical host (e.g. www.reddit.com) — do NOT force old.reddit.com to prevent login walls (reason=lor2)
         parsed = urlparse(url)
         clean_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
         return clean_url
@@ -1128,8 +1138,8 @@ async def check_comment(url: str):
         sub_match = re.search(r'/r/([^/]+)', resolved_url)
         subreddit = sub_match.group(1) if sub_match else "all"
         
-        # Initial Fetch (Narrow)
-        fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=0&limit=1"
+        # Initial Fetch (Use www.reddit.com with context=3 to guarantee target comment context)
+        fetch_url = f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=3"
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
@@ -1139,6 +1149,16 @@ async def check_comment(url: str):
             )
             
         if resp.status_code == 404:
+            # Fallback to old.reddit.com
+            try:
+                fetch_url_old = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=3"
+                resp_old = await stealth_fetch(fetch_url_old)
+                if resp_old.status_code == 200:
+                    resp = resp_old
+            except Exception:
+                pass
+
+        if resp.status_code == 404:
             return Response(
                 content=json.dumps({"status": "not_found", "error": "Thread not found", "post_status": "deleted"}), 
                 status_code=404, media_type="application/json"
@@ -1147,7 +1167,14 @@ async def check_comment(url: str):
         try:
             data = resp.json()
         except:
-            return Response(content=json.dumps({"status": "error", "error": "Invalid JSON"}), status_code=403, media_type="application/json")
+            # Fallback if www returned non-JSON
+            try:
+                fetch_url_old = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=3"
+                resp_old = await stealth_fetch(fetch_url_old)
+                data = resp_old.json()
+                resp = resp_old
+            except Exception:
+                return Response(content=json.dumps({"status": "error", "error": "Invalid JSON"}), status_code=403, media_type="application/json")
             
         post_data = data[0]["data"]["children"][0]["data"]
         post_status = "active"
@@ -1163,10 +1190,10 @@ async def check_comment(url: str):
             FALLBACK_STATS["narrow_hit"] += 1
         else:
             FALLBACK_STATS["fallback_fired"] += 1
-            print(f"[FALLBACK_FIRED] {comment_id} — narrow fetch (limit=1,context=0) missed target, retrying wide")
+            print(f"[FALLBACK_FIRED] {comment_id} — narrow fetch missed target, retrying wide")
             
             # Fallback (Wide)
-            fetch_url_ctx = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1"
+            fetch_url_ctx = f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=5"
             try:
                 resp2 = await stealth_fetch(fetch_url_ctx)
                 if resp2.status_code == 200:
@@ -1211,7 +1238,8 @@ async def check_comment(url: str):
         # Backward compatibility aliases for the Node.js bot
         result["liveness"] = status if status != "live" else "live"
         
-        http_status = 200 if status == "live" else 404
+        # Return 200 for successful check resolution (the status field indicates live/removed/deleted)
+        http_status = 200
         
         print(f"[COMMENT] {comment_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
         
