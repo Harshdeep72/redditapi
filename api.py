@@ -41,9 +41,9 @@ FALLBACK_STATS = {"narrow_hit": 0, "fallback_fired": 0, "fallback_hit": 0, "tota
 # Set PROXY_ENABLED=false in HF Space env vars to skip proxy entirely and go
 # direct on every request.  Useful when the proxy port is firewalled by the
 # hosting provider (e.g. port 823 is blocked from Hugging Face).
-_PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+_PROXY_ENABLED = os.environ.get("PROXY_ENABLED", "false").strip().lower() in ("true", "1", "yes", "on")
 if not _PROXY_ENABLED:
-    print("[PROXY] PROXY_ENABLED=false — all requests will go direct (no proxy).")
+    print("[PROXY] PROXY_ENABLED is false — all proxies disabled, requests will go direct.")
 
 # -----------------------------------------------------------------------
 # Two-tier concurrency control:
@@ -230,6 +230,11 @@ def _expand_dataimpulse(raw: str, lines: list) -> None:
 def load_proxies():
     """Load proxies with DataImpulse multi-gateway support."""
     global PROXIES, IS_SINGLE_ROTATING_GATEWAY
+    if not _PROXY_ENABLED:
+        PROXIES = []
+        IS_SINGLE_ROTATING_GATEWAY = False
+        print("[PROXY] Proxies disabled (_PROXY_ENABLED=false) — skipping proxy pool load.")
+        return
     lines = []
 
     _is_di = lambda s: "dataimpulse" in s.lower()
@@ -1027,10 +1032,13 @@ async def resolve_url(url: str) -> str:
         # If it's a share link or redd.it link, resolve it
         if "redd.it" in url or "/s/" in url:
             resolved = False
+            _cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
+            _cookie_header = f"reddit_session={_cookie}; csv=2; over18=1" if _cookie else "csv=2; over18=1"
             req_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://www.reddit.com/",
+                "Cookie": _cookie_header,
             }
             
             # Step 1: Try HEAD with allow_redirects=False (read 301/302 location header directly)
