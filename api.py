@@ -319,6 +319,32 @@ def get_healthy_proxy() -> Optional[str]:
 
 _WARMUP_DONE = False
 
+def format_reddit_cookie(cookie: Optional[str] = None) -> str:
+    """Format and normalize Reddit cookie string.
+
+    Handles:
+      - Full cookie strings: 'csv=2; reddit_session=...; edgebucket=...'
+      - Raw session strings: 'reddit_session=...' or 'eyJhbGci...'
+      - Missing cookies: defaults to 'csv=2; over18=1'
+    """
+    if cookie is None:
+        cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION") or ""
+    cookie = cookie.strip()
+    if not cookie:
+        return "csv=2; over18=1"
+
+    if "=" in cookie:
+        cookie_str = cookie
+    else:
+        cookie_str = f"reddit_session={cookie}"
+
+    if "csv=" not in cookie_str:
+        cookie_str += "; csv=2"
+    if "over18=" not in cookie_str:
+        cookie_str += "; over18=1"
+    return cookie_str
+
+
 async def warmup_proxy() -> bool:
     """
     Force DataImpulse to give us a fresh egress IP by making a request
@@ -330,8 +356,7 @@ async def warmup_proxy() -> bool:
         return False
 
     proxies_config = {"http": proxy, "https": proxy}
-    _cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION", "")
-    _cookie_str = f"reddit_session={_cookie}; over18=1; csv=1" if _cookie else "csv=1; over18=1"
+    _cookie_str = format_reddit_cookie()
 
     # Try different impersonations to force a new egress IP
     for impersonation in ["chrome131", "firefox", "safari"]:
@@ -419,11 +444,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     "Referer": "https://www.reddit.com/",
                 }
 
-                cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
-                if cookie:
-                    headers["Cookie"] = f"reddit_session={cookie}; over18=1; csv=1"
-                else:
-                    headers["Cookie"] = "csv=1; over18=1"
+                headers["Cookie"] = format_reddit_cookie()
 
                 if impersonate_target == "chrome131":
                     headers.update({
@@ -496,11 +517,7 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                     "Connection": "keep-alive",
                     "Referer": "https://www.reddit.com/",
                 }
-                cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
-                if cookie:
-                    headers["Cookie"] = f"reddit_session={cookie}"
-                else:
-                    headers["Cookie"] = "csv=1; over18=1"
+                headers["Cookie"] = format_reddit_cookie()
 
                 if impersonate_target == "chrome131":
                     headers.update({
@@ -545,8 +562,7 @@ async def bulk_stealth_fetch(url: str, method: str = "GET", allow_redirects: boo
 
         def _build_reddit_headers(impersonate_target: str) -> dict:
                 """Build Reddit-compatible headers, always injecting the session cookie."""
-                cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION", "")
-                cookie_str = f"reddit_session={cookie}; over18=1; csv=1" if cookie else "csv=1; over18=1"
+                cookie_str = format_reddit_cookie()
                 h = {
                     "Accept": "application/json, text/html, */*;q=0.9",
                     "Accept-Language": "en-US,en;q=0.9",
@@ -1032,8 +1048,7 @@ async def resolve_url(url: str) -> str:
         # If it's a share link or redd.it link, resolve it
         if "redd.it" in url or "/s/" in url:
             resolved = False
-            _cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")
-            _cookie_header = f"reddit_session={_cookie}; csv=2; over18=1" if _cookie else "csv=2; over18=1"
+            _cookie_header = format_reddit_cookie()
             req_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1137,18 +1152,21 @@ async def check_comment(url: str):
             return Response(content=json.dumps({"status": "error", "error": str(ve)}), status_code=400, media_type="application/json")
         
         # Extract post_id and comment_id
-        # Expected format: .../comments/{post_id}/title/{comment_id} or .../comments/{post_id}/_/{comment_id}
-        match = re.search(r'/comments/([^/]+)/[^/]+/([^/]+)', resolved_url)
+        # Strip query parameters before extracting IDs
+        parsed_res = urlparse(resolved_url)
+        clean_path = parsed_res.path.rstrip("/")
+        match = re.search(r'/comments/([^/]+)/[^/]+/([^/]+)', clean_path)
         if not match:
             return Response(
                 content=json.dumps({"status": "error", "error": "Invalid comment URL format"}), 
                 status_code=400, media_type="application/json"
             )
             
-        post_id, comment_id = match.groups()
+        post_id = re.sub(r'[^a-zA-Z0-9_]', '', match.group(1))
+        comment_id = re.sub(r'[^a-zA-Z0-9_]', '', match.group(2))
         
         # Subreddit extraction
-        sub_match = re.search(r'/r/([^/]+)', resolved_url)
+        sub_match = re.search(r'/r/([^/]+)', clean_path)
         subreddit = sub_match.group(1) if sub_match else "all"
         
         # Initial Fetch (Use www.reddit.com with context=3 to guarantee target comment context)
@@ -1220,9 +1238,17 @@ async def check_comment(url: str):
                 FALLBACK_STATS["total_miss"] += 1
                 
         if not comment_data:
+            result = {
+                "status": "not_found",
+                "liveness": "not_found",
+                "author": None,
+                "subreddit": subreddit,
+                "post_status": post_status,
+                "error": "Comment not found in tree (deleted or removed)",
+            }
             return Response(
-                content=json.dumps({"status": "not_found", "error": "Comment not found in tree", "post_status": post_status}), 
-                status_code=404, media_type="application/json"
+                content=json.dumps({"success": True, "data": result}), 
+                status_code=200, media_type="application/json"
             )
             
         body = comment_data.get("body", "")
@@ -1618,7 +1644,9 @@ async def check_account(username: str, include_activity: bool = False):
 async def proxy_json(url: str):
     start_time = time.time()
     try:
-        resp = await stealth_fetch(url)
+        # Route old.reddit.com requests to www.reddit.com to prevent 429 datacenter IP blocks
+        target_url = url.replace("https://old.reddit.com/", "https://www.reddit.com/")
+        resp = await stealth_fetch(target_url)
         if resp.status_code == 200:
             print(f"[PROXY_JSON] 200 OK ({int((time.time() - start_time)*1000)}ms)")
             return Response(content=resp.text, status_code=200, media_type="application/json")
@@ -1749,4 +1777,54 @@ async def debug_proxy_endpoint():
         status_code=200,
         media_type="application/json"
     )
+
+
+@app.get("/api/external/test-cookie")
+async def test_cookie():
+    """Test whether the configured Reddit session cookie is valid and accepted by Reddit."""
+    cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION") or ""
+    masked = (cookie[:15] + "..." + cookie[-15:]) if len(cookie) > 30 else (cookie[:5] + "..." if cookie else "NONE")
+    formatted = format_reddit_cookie(cookie)
+    has_session = "reddit_session=" in formatted
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.reddit.com/",
+        "Cookie": formatted,
+    }
+
+    fetch_result = {}
+    try:
+        async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+            r = await session.get("https://www.reddit.com/api/v1/me", headers=headers, timeout=12)
+            fetch_result["status"] = r.status_code
+            if r.status_code == 200:
+                me_data = r.json()
+                fetch_result["username"] = me_data.get("name")
+                fetch_result["is_gold"] = me_data.get("is_gold")
+                fetch_result["authenticated"] = True
+            elif r.status_code == 403:
+                fetch_result["error"] = "Forbidden (403) — cookie may be invalid or expired"
+            elif r.status_code == 401:
+                fetch_result["error"] = "Unauthorized (401) — invalid session cookie"
+            elif r.status_code == 429:
+                fetch_result["error"] = "Rate limited (429) — Reddit blocking datacenter IP without valid session"
+            else:
+                fetch_result["text_preview"] = r.text[:200]
+    except Exception as e:
+        fetch_result["exception"] = f"{type(e).__name__}: {str(e)}"
+
+    return Response(
+        content=json.dumps({
+            "cookie_configured": bool(cookie),
+            "cookie_length": len(cookie),
+            "cookie_preview": masked,
+            "has_reddit_session_key": has_session,
+            "reddit_test": fetch_result
+        }),
+        status_code=200,
+        media_type="application/json"
+    )
+
 
