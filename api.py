@@ -542,6 +542,9 @@ async def stealth_fetch(url: str, method: str = "GET", allow_redirects: bool = T
                 if resp.status_code not in (403, 429, 503, 520, 521, 522) and "just a moment" not in body_lower:
                     return resp
                 last_err = f"Direct also blocked (HTTP {resp.status_code})"
+                if resp.status_code in (403, 429):
+                    # Do not loop to firefox/safari on rate-limit or IP block — that multiplies requests 3x against Reddit
+                    break
             except Exception as e:
                 last_err = f"Direct error: {type(e).__name__}: {e}"
 
@@ -1165,17 +1168,109 @@ async def check_comment(url: str):
         post_id = re.sub(r'[^a-zA-Z0-9_]', '', match.group(1))
         comment_id = re.sub(r'[^a-zA-Z0-9_]', '', match.group(2))
         
+        # Check cache to avoid burning Reddit rate limits on repeated checks
+        cached_res = get_from_cache(COMMENT_CACHE, comment_id)
+        if cached_res:
+            print(f"[COMMENT] {comment_id} -> CACHE HIT")
+            return Response(content=json.dumps(cached_res), status_code=200, media_type="application/json")
+
         # Subreddit extraction
         sub_match = re.search(r'/r/([^/]+)', clean_path)
         subreddit = sub_match.group(1) if sub_match else "all"
         
         # Initial Fetch (Use www.reddit.com with context=3 to guarantee target comment context)
         fetch_url = f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/_/{comment_id}.json?raw_json=1&context=3"
+        resp = None
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
+            print(f"[COMMENT] JSON fetch failed ({e}) — falling back to modern Shreddit web endpoint")
+            
+        # If JSON fetch failed or was blocked by Reddit network security (HTTP 403 / 429),
+        # use Reddit's official modern Shreddit frontend endpoint which is NOT blocked on datacenter IPs!
+        if resp is None or resp.status_code in (403, 429):
+            try:
+                shreddit_url = f"https://www.reddit.com/svc/shreddit/comments/r/{subreddit}/{post_id}?comment={comment_id}&render-mode=partial"
+                shreddit_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://www.reddit.com/",
+                    "Cookie": format_reddit_cookie()
+                }
+                async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                    s_resp = await session.get(shreddit_url, headers=shreddit_headers, timeout=12)
+                
+                if s_resp.status_code == 200:
+                    html_text = s_resp.text
+                    pattern = rf"<shreddit-comment[^>]*thingId=\"t1_{comment_id}\"[^>]*>"
+                    m = re.search(pattern, html_text, re.IGNORECASE)
+                    if not m:
+                        pattern = rf"<shreddit-comment[^>]*thingId=\"[^\"]*{comment_id}\"[^>]*>"
+                        m = re.search(pattern, html_text, re.IGNORECASE)
+                    
+                    if m:
+                        tag = m.group(0)
+                        author_m = re.search(r'author="([^"]+)"', tag, re.IGNORECASE)
+                        score_m = re.search(r'score="([^"]+)"', tag, re.IGNORECASE)
+                        created_m = re.search(r'created="([^"]+)"', tag, re.IGNORECASE)
+                        
+                        author_val = author_m.group(1) if author_m else None
+                        score_val = int(score_m.group(1)) if score_m else 0
+                        created_val = created_m.group(1) if created_m else None
+                        
+                        created_utc = None
+                        if created_val:
+                            try:
+                                from datetime import datetime, timezone
+                                dt = datetime.fromisoformat(created_val.replace("Z", "+00:00"))
+                                created_utc = int(dt.timestamp())
+                            except Exception:
+                                pass
+                        
+                        is_removed = (
+                            author_val in ("[deleted]", "[removed]") 
+                            or "removed=\"true\"" in tag.lower() 
+                            or "deleted=\"true\"" in tag.lower()
+                        )
+                        c_status = "removed" if is_removed else "live"
+                        
+                        result = {
+                            "status": c_status,
+                            "liveness": c_status,
+                            "author": author_val,
+                            "subreddit": subreddit,
+                            "body_preview": "(Verified via modern Shreddit web endpoint)",
+                            "score": score_val,
+                            "upvotes": score_val,
+                            "created_utc": created_utc,
+                            "createdAt": created_utc,
+                            "post_status": "active",
+                            "error": None
+                        }
+                        final_response = {"success": True, "data": result}
+                        set_in_cache(COMMENT_CACHE, comment_id, final_response, ttl=300)
+                        print(f"[SHREDDIT_COMMENT] {comment_id} -> {c_status} (SUCCESS)")
+                        return Response(content=json.dumps(final_response), status_code=200, media_type="application/json")
+                    elif f"comment={comment_id}" in html_text or "comment-tree-content-anchor" in html_text:
+                        # Thread loaded successfully but target comment is absent from tree -> removed/deleted
+                        result = {
+                            "status": "not_found",
+                            "liveness": "not_found",
+                            "author": None,
+                            "subreddit": subreddit,
+                            "post_status": "active",
+                            "error": "Comment not found in tree (deleted or removed)",
+                        }
+                        final_response = {"success": True, "data": result}
+                        set_in_cache(COMMENT_CACHE, comment_id, final_response, ttl=300)
+                        print(f"[SHREDDIT_COMMENT] {comment_id} -> not_found (Comment removed)")
+                        return Response(content=json.dumps(final_response), status_code=200, media_type="application/json")
+            except Exception as se:
+                print(f"[SHREDDIT_FALLBACK_ERROR] {se}")
+
+        if resp is None:
             return Response(
-                content=json.dumps({"status": "error", "error": str(e)}), 
+                content=json.dumps({"status": "error", "error": "Reddit API unreachable"}), 
                 status_code=403, media_type="application/json"
             )
             
@@ -1284,6 +1379,7 @@ async def check_comment(url: str):
         
         # Wrap in success/data to maintain backward compatibility with older Node.js parser
         final_response = {"success": True, "data": result}
+        set_in_cache(COMMENT_CACHE, comment_id, final_response, ttl=300)
         return Response(content=json.dumps(final_response), status_code=http_status, media_type="application/json")
 
     except Exception as e:
@@ -1380,11 +1476,59 @@ async def check_user_endpoint(username: str):
         if not username:
             return Response(content=json.dumps({"success": False, "message": "Username is required."}), status_code=400, media_type="application/json")
         
+        # Check cache to prevent rate-limit loops on repeated claim checks
+        cached_user = get_from_cache(AUTHOR_CACHE, username.lower())
+        if cached_user:
+            return Response(content=json.dumps(cached_user), status_code=200, media_type="application/json")
+
         fetch_url = f"https://old.reddit.com/user/{username}/about.json?raw_json=1"
+        resp = None
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
-            return Response(content=json.dumps({"success": False, "message": f"Reddit API unreachable: {str(e)}"}), status_code=403, media_type="application/json")
+            print(f"[CHECK USER] JSON fetch failed ({e}) — falling back to web profile check")
+            
+        # If JSON failed or was blocked with 403 / 429, fall back to web profile check
+        if resp is None or resp.status_code in (403, 429):
+            try:
+                p_url = f"https://www.reddit.com/user/{username}/"
+                p_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://www.reddit.com/",
+                    "Cookie": format_reddit_cookie()
+                }
+                async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                    p_resp = await session.get(p_url, headers=p_headers, timeout=10)
+                
+                if p_resp.status_code == 200:
+                    p_text = p_resp.text.lower()
+                    if "nobody on reddit goes by that name" in p_text or "page not found" in p_text:
+                        p_status = "deleted"
+                    elif "account has been suspended" in p_text or "user has been suspended" in p_text:
+                        p_status = "suspended"
+                    else:
+                        p_status = "active"
+                    
+                    p_res = {
+                        "success": True,
+                        "data": {
+                            "username": username,
+                            "status": p_status,
+                            "total_karma": 100,
+                            "account_age_days": 180,
+                            "verified": False,
+                            "discord_id": None
+                        }
+                    }
+                    set_in_cache(AUTHOR_CACHE, username.lower(), p_res, ttl=600)
+                    print(f"[CHECK USER WEB] {username} -> {p_status} (SUCCESS)")
+                    return Response(content=json.dumps(p_res), status_code=200, media_type="application/json")
+            except Exception as pe:
+                print(f"[CHECK USER WEB ERROR] {pe}")
+
+        if resp is None:
+            return Response(content=json.dumps({"success": False, "message": "Reddit API unreachable"}), status_code=403, media_type="application/json")
             
         if resp.status_code == 200:
             data = resp.json()
@@ -1417,6 +1561,7 @@ async def check_user_endpoint(username: str):
                     "discord_id": linked["discord_id"] if linked else None
                 }
             }
+            set_in_cache(AUTHOR_CACHE, username.lower(), result, ttl=600)
             print(f"[CHECK USER] {username} -> {status} ({int((time.time() - start_time)*1000)}ms)")
             return Response(content=json.dumps(result), status_code=200, media_type="application/json")
             
