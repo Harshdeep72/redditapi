@@ -1234,12 +1234,23 @@ async def check_comment(url: str):
                         )
                         c_status = "removed" if is_removed else "live"
                         
+                        body_snippet = None
+                        after_tag = html_text[m.end():m.end() + 4000]
+                        body_m = re.search(r'<div[^>]*slot="comment"[^>]*>(.*?)</div>', after_tag, re.DOTALL)
+                        if body_m:
+                            import html as html_lib
+                            raw_text = re.sub(r'<[^>]+>', ' ', body_m.group(1))
+                            body_snippet = html_lib.unescape(re.sub(r'\s+', ' ', raw_text).strip())
+                        
+                        body_display = body_snippet or "(Verified via modern Shreddit web endpoint)"
+
                         result = {
                             "status": c_status,
                             "liveness": c_status,
                             "author": author_val,
                             "subreddit": subreddit,
-                            "body_preview": "(Verified via modern Shreddit web endpoint)",
+                            "body_preview": body_display,
+                            "body_snippet": body_display,
                             "score": score_val,
                             "upvotes": score_val,
                             "created_utc": created_utc,
