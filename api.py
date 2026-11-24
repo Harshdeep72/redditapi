@@ -318,6 +318,23 @@ def get_healthy_proxy() -> Optional[str]:
 
 
 _WARMUP_DONE = False
+_CURRENT_COOKIE: Optional[str] = None
+
+def get_raw_reddit_cookie() -> str:
+    global _CURRENT_COOKIE
+    if _CURRENT_COOKIE:
+        return _CURRENT_COOKIE
+    cookie_file = os.path.join(os.path.dirname(__file__), "cookie.txt")
+    if os.path.exists(cookie_file):
+        try:
+            with open(cookie_file, "r") as f:
+                c = f.read().strip()
+                if c:
+                    _CURRENT_COOKIE = c
+                    return c
+        except Exception:
+            pass
+    return os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION") or ""
 
 def format_reddit_cookie(cookie: Optional[str] = None) -> str:
     """Format and normalize Reddit cookie string.
@@ -328,7 +345,7 @@ def format_reddit_cookie(cookie: Optional[str] = None) -> str:
       - Missing cookies: defaults to 'csv=2; over18=1'
     """
     if cookie is None:
-        cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION") or ""
+        cookie = get_raw_reddit_cookie()
     cookie = cookie.strip()
     if not cookie:
         return "csv=2; over18=1"
@@ -1851,7 +1868,7 @@ async def health():
         content=json.dumps({
             "status": "ok",
             "proxy_enabled": _PROXY_ENABLED,
-            "session_cookie_set": bool(os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION")),
+            "session_cookie_set": bool(get_raw_reddit_cookie()),
             "proxy_list_url_set": bool(os.environ.get("PROXY_LIST_URL", "").strip()),
             "proxy_total": len(PROXIES),
             "proxy_healthy": len(healthy),
@@ -1938,7 +1955,7 @@ async def debug_proxy_endpoint():
 @app.get("/api/external/test-cookie")
 async def test_cookie():
     """Test whether the configured Reddit session cookie is valid and accepted by Reddit."""
-    cookie = os.environ.get("REDDIT_SESSION_COOKIE") or os.environ.get("REDDIT_SESSION") or ""
+    cookie = get_raw_reddit_cookie()
     masked = (cookie[:15] + "..." + cookie[-15:]) if len(cookie) > 30 else (cookie[:5] + "..." if cookie else "NONE")
     formatted = format_reddit_cookie(cookie)
     has_session = "reddit_session=" in formatted
@@ -1982,5 +1999,24 @@ async def test_cookie():
         status_code=200,
         media_type="application/json"
     )
+
+
+@app.post("/api/external/update-cookie")
+async def update_cookie(request: Request):
+    """Update Reddit session cookie dynamically."""
+    global _CURRENT_COOKIE
+    try:
+        body = await request.json()
+        new_cookie = body.get("cookie", "").strip()
+        if not new_cookie:
+            return Response(content=json.dumps({"error": "No cookie provided"}), status_code=400, media_type="application/json")
+        _CURRENT_COOKIE = new_cookie
+        cookie_file = os.path.join(os.path.dirname(__file__), "cookie.txt")
+        with open(cookie_file, "w") as f:
+            f.write(new_cookie)
+        return Response(content=json.dumps({"success": True, "message": "Cookie updated successfully", "length": len(new_cookie)}), status_code=200, media_type="application/json")
+    except Exception as e:
+        return Response(content=json.dumps({"error": str(e)}), status_code=500, media_type="application/json")
+
 
 
