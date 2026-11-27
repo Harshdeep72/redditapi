@@ -1432,10 +1432,84 @@ async def check_post(url: str):
         subreddit = sub_match.group(1) if sub_match else "all"
         
         fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=1&raw_json=1"
+        resp = None
+        last_err = None
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
-            return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=403, media_type="application/json")
+            last_err = str(e)
+            print(f"[POST] JSON fetch failed ({e}) — falling back to old.reddit.com HTML")
+
+        if resp is None or resp.status_code in (403, 429):
+            try:
+                old_html_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/"
+                old_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer": "https://old.reddit.com/",
+                    "Cookie": format_reddit_cookie(),
+                }
+                async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                    h_resp = await session.get(old_html_url, headers=old_headers, timeout=15)
+
+                if h_resp.status_code == 404:
+                    return Response(content=json.dumps({"status": "not_found", "error": "Post not found"}), status_code=404, media_type="application/json")
+
+                if h_resp.status_code == 200 and "<html" in h_resp.text[:1000].lower():
+                    import html as html_lib
+                    html_text = h_resp.text
+                    thing_m = re.search(rf'<div[^>]*id="thing_t3_{post_id}"[^>]*>', html_text) or re.search(r'<div[^>]*id="thing_t3_[^"]*"[^>]*>', html_text)
+                    tag = thing_m.group(0) if thing_m else ""
+                    author_m = re.search(r'data-author="([^"]+)"', tag) or re.search(r'data-author="([^"]+)"', html_text)
+                    sub_m = re.search(r'data-subreddit="([^"]+)"', tag) or re.search(r'data-subreddit="([^"]+)"', html_text)
+                    score_m = re.search(r'data-score="(\d+)"', tag)
+                    ts_m = re.search(r'data-timestamp="(\d+)"', tag)
+                    title_m = re.search(r'<title>(.*?)</title>', html_text, re.S)
+
+                    author_val = author_m.group(1) if author_m else None
+                    sub_val = sub_m.group(1) if sub_m else subreddit
+                    score_val = int(score_m.group(1)) if score_m else 0
+                    created_utc = int(ts_m.group(1)) // 1000 if ts_m else None
+                    title_val = html_lib.unescape(title_m.group(1).strip()) if title_m else None
+
+                    if title_val and "page not found" in title_val.lower():
+                        return Response(content=json.dumps({"status": "not_found", "error": "Post not found"}), status_code=404, media_type="application/json")
+
+                    is_removed = (
+                        "[removed]" in html_text[:30000]
+                        or "Sorry, this post was removed by Reddit" in html_text
+                        or "Sorry, this post has been removed by the moderators" in html_text
+                    )
+                    is_deleted = (
+                        author_val == "[deleted]"
+                        or "Sorry, this post was deleted by the person who originally posted it" in html_text
+                    )
+
+                    status = "deleted" if is_deleted else ("removed" if is_removed else "active")
+                    liveness = "deleted" if is_deleted else ("removed" if is_removed else "live")
+
+                    if author_val or (title_val and "reddit" not in title_val.lower()):
+                        result = {
+                            "status": status,
+                            "liveness": liveness,
+                            "author": author_val,
+                            "subreddit": sub_val,
+                            "title": title_val,
+                            "score": score_val,
+                            "upvotes": score_val,
+                            "num_comments": 0,
+                            "removed_by_category": "moderator" if is_removed else None,
+                            "created_utc": created_utc,
+                            "createdAt": created_utc,
+                            "error": None,
+                        }
+                        print(f"[POST_HTML] {post_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
+                        return Response(content=json.dumps({"success": True, "data": result}), status_code=200, media_type="application/json")
+            except Exception as he:
+                print(f"[POST_HTML_FALLBACK_ERROR] {he}")
+
+        if resp is None:
+            return Response(content=json.dumps({"status": "error", "error": last_err or "Reddit API unreachable"}), status_code=403, media_type="application/json")
             
         if resp.status_code == 404:
             return Response(content=json.dumps({"status": "not_found", "error": "Post not found"}), status_code=404, media_type="application/json")
