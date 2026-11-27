@@ -1436,14 +1436,14 @@ async def check_post(url: str):
             print(f"[POST] {post_id} -> CACHE HIT")
             return Response(content=json.dumps(cached_post), status_code=200, media_type="application/json")
 
-        fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=1&raw_json=1"
+        fetch_url = f"https://www.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=1&raw_json=1"
         resp = None
         last_err = None
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
             last_err = str(e)
-            print(f"[POST] JSON fetch failed ({e}) — falling back to old.reddit.com HTML")
+            print(f"[POST] www JSON fetch failed ({e}) — falling back to old.reddit.com HTML")
 
         if resp is None or resp.status_code in (403, 429):
             try:
@@ -1566,11 +1566,12 @@ async def check_post(url: str):
         else:
             result["liveness"] = status
         
-        http_status = 200 if status == "active" else 404
+        http_status = 200
         print(f"[POST] {post_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
         
         # Wrap in success/data to maintain backward compatibility
         final_response = {"success": True, "data": result}
+        set_in_cache(COMMENT_CACHE, f"post:{post_id}", final_response, ttl=300)
         return Response(content=json.dumps(final_response), status_code=http_status, media_type="application/json")
 
     except Exception as e:
