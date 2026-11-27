@@ -1829,11 +1829,13 @@ async def check_account(username: str, include_activity: bool = False):
         else:
             username = re.sub(r'^/?u/', '', username, flags=re.IGNORECASE).strip().rstrip("/")
         
-        fetch_url = f"https://old.reddit.com/user/{username}/about.json?raw_json=1"
+        fetch_url = f"https://www.reddit.com/user/{username}/about.json?raw_json=1"
+        resp = None
         try:
             resp = await stealth_fetch(fetch_url)
         except Exception as e:
-            return Response(content=json.dumps({"status": "error", "error": str(e)}), status_code=403, media_type="application/json")
+            print(f"[ACCOUNT] www about.json failed ({e}) — falling back to check_user_endpoint")
+            return await check_user_endpoint(username)
             
         if resp.status_code == 200:
             data = resp.json()
