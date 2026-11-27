@@ -1430,7 +1430,12 @@ async def check_post(url: str):
         
         sub_match = re.search(r'/r/([^/]+)', resolved_url)
         subreddit = sub_match.group(1) if sub_match else "all"
-        
+
+        cached_post = get_from_cache(COMMENT_CACHE, f"post:{post_id}")
+        if cached_post:
+            print(f"[POST] {post_id} -> CACHE HIT")
+            return Response(content=json.dumps(cached_post), status_code=200, media_type="application/json")
+
         fetch_url = f"https://old.reddit.com/r/{subreddit}/comments/{post_id}/.json?limit=1&raw_json=1"
         resp = None
         last_err = None
@@ -1449,8 +1454,14 @@ async def check_post(url: str):
                     "Referer": "https://old.reddit.com/",
                     "Cookie": format_reddit_cookie(),
                 }
-                async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
-                    h_resp = await session.get(old_html_url, headers=old_headers, timeout=15)
+                h_resp = None
+                for h_attempt in range(2):
+                    async with cffi_requests.AsyncSession(impersonate="chrome131") as session:
+                        h_resp = await session.get(old_html_url, headers=old_headers, timeout=15)
+                    if h_resp.status_code in (200, 404):
+                        break
+                    if h_resp.status_code in (429, 403) and h_attempt == 0:
+                        await asyncio.sleep(1.5)
 
                 if h_resp.status_code == 404:
                     return Response(content=json.dumps({"status": "not_found", "error": "Post not found"}), status_code=404, media_type="application/json")
@@ -1504,7 +1515,9 @@ async def check_post(url: str):
                             "error": None,
                         }
                         print(f"[POST_HTML] {post_id} -> {status} ({int((time.time() - start_time)*1000)}ms)")
-                        return Response(content=json.dumps({"success": True, "data": result}), status_code=200, media_type="application/json")
+                        final_resp = {"success": True, "data": result}
+                        set_in_cache(COMMENT_CACHE, f"post:{post_id}", final_resp, ttl=300)
+                        return Response(content=json.dumps(final_resp), status_code=200, media_type="application/json")
             except Exception as he:
                 print(f"[POST_HTML_FALLBACK_ERROR] {he}")
 
